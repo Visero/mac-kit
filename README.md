@@ -5,10 +5,14 @@
 - 纯 Swift + AppKit / SwiftUI，编译产物约 200 KB
 - 常驻菜单栏，平时不占 Dock（`LSUIElement`）；打开设置窗口时临时显示 Dock 图标
 - 用 Carbon `RegisterEventHotKey` 注册全局热键，**不需要辅助功能（Accessibility）权限**
+- 设置窗口左侧是侧栏：**快捷启动**（全局快捷键）和 **常用工具**（一键清空记录）
+- 常用工具：清空 Safari 浏览记录、最近使用文件记录，可分别勾选
 - 图标与设置窗口都按 macOS 26/27 的 Liquid Glass 风格重新设计
 - 配置是一个 JSON 文件，改完点「重新加载配置」即生效
 
-![设置窗口](docs/settings-window.png)
+| 快捷启动 | 常用工具 |
+|---|---|
+| ![快捷启动](docs/settings-window.png) | ![常用工具](docs/tools-window.png) |
 
 ## 图标
 
@@ -28,12 +32,20 @@
 
 ## 设置窗口
 
-菜单栏图标 →「偏好设置…」（⌘,）。
+菜单栏图标 →「偏好设置…」（⌘,）。窗口分成侧栏和右侧内容两块，侧栏切换两个页面。
 
-- 顶部：图标 + 名称 + 说明
+**快捷启动**（默认页）：
+
 - 快捷键列表：每条显示按键、目标 App、解析到的真实路径和注册状态（✓ / ⚠）
 - 开关：登录时自动启动（`SMAppService`）、显示菜单栏图标、显示 Dock 图标
 - 按钮：编辑配置 / 重新加载 / 退出
+
+**常用工具**：
+
+- Safari 浏览记录、最近使用文件记录两个开关，决定「一键清空记录」清哪些
+- 一键清空记录：二次确认后删除对应文件，结果显示在页面上
+- 两个目录都受 TCC 保护，需要在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里勾选 mac-kit；页面里有直接跳转该设置的按钮
+- 清 Safari 历史前要先退出 Safari（运行中的记录会被写回）
 
 ### 隐藏菜单栏图标 / 隐藏 Dock 图标
 
@@ -91,8 +103,8 @@ APP=/Applications/mac-kit.app/Contents/MacOS/mac-kit
 $APP --check                 # 检查每个快捷键能否注册、目标能否解析、当前图标选型
 $APP --open Finder           # 单独测试某个 target 能否被打开
 $APP --settings              # 启动并直接打开设置窗口
-$APP --check                 # 会报告图标选型
-$APP --snapshot out.png      # 离屏渲染设置界面（用于检查排版）
+$APP --tools-check           # 只读检查清理目标（列出文件、报告是否有完全磁盘访问权限）
+$APP --snapshot out.png      # 离屏渲染设置界面（检查排版），加 --page tools 渲染常用工具页
 ```
 
 `--check` 输出示例：
@@ -101,6 +113,17 @@ $APP --snapshot out.png      # 离屏渲染设置界面（用于检查排版）
 ✓ ⌥⌘3 → kitty  (/Applications/kitty.app)
 当前外观: dark，图标: 已加载（AppIcon-Dark.icns）
 6/6 个快捷键可用
+```
+
+`--tools-check` 不会删除任何文件，只告诉你目标路径是否可访问、有哪些文件会被清理：
+
+```
+Safari 运行中: 否
+Safari 记录目录: 可访问
+  存在  History.db
+  不存在  History.db-wal
+最近使用目录: /Users/kaix/Library/Application Support/com.apple.sharedfilelist
+  待清理 12 项
 ```
 
 ## 日志
@@ -143,7 +166,7 @@ rm -rf ~/Library/Application\ Support/mac-kit
 rm -f ~/Library/Logs/mac-kit.log
 ```
 
-开过「登录时自动启动」的话，先在设置窗口里关掉再删。
+开过「登录时自动启动」的话，先在设置窗口里关掉再删。若在系统设置里给过完全磁盘访问权限，记得一并取消。
 
 ## 实现要点
 
@@ -151,5 +174,7 @@ rm -f ~/Library/Logs/mac-kit.log
 - `RegisterEventHotKey` 返回的 `EventHotKeyRef` 都存着，重载配置时先 `UnregisterEventHotKey`
 - 打开用 `NSWorkspace.openApplication(at:configuration:)`，已运行则激活
 - 设置窗口是 `NSHostingView(SwiftUI)` 套在 `NSGlassEffectView` 里，窗口 `titlebarAppearsTransparent` + `fullSizeContentView`
+- 侧栏选中项、清空确认弹窗都存在 `MacKitModel`（`@Published`）里，没有用 `@State`——纯 Command Line Tools 环境没有 SwiftUI 宏插件，`@State` 编译不过
 - 菜单栏图标与 Dock 图标分别由 `NSStatusItem.isVisible` 和 `NSApp.setActivationPolicy(_:)` 控制，状态存 `UserDefaults`
+- 记录清理只看两处：`~/Library/Safari/History.db*` 和 `~/Library/Application Support/com.apple.sharedfilelist/` 下的 `RecentDocuments` / `RecentApplications` / 各 App 的 `.sfl3`；TCC 拦截时目录本身读不到，据此判定需要完全磁盘访问权限
 - 保留热键 `⌥⌘,`（Carbon 注册，id `0xF000`）用于兜底打开设置窗口

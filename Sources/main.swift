@@ -165,6 +165,152 @@ enum Preferences {
     }
 }
 
+// MARK: - 记录清理（Safari 浏览记录 / 最近使用文件）
+
+enum RecordCleaner {
+    struct Result {
+        let message: String
+        let needsFullDiskAccess: Bool
+    }
+
+    private static var home: URL { FileManager.default.homeDirectoryForCurrentUser }
+
+    private static var safariHistoryFiles: [URL] {
+        let dir = home.appendingPathComponent("Library/Safari", isDirectory: true)
+        return ["History.db", "History.db-wal", "History.db-shm"].map { dir.appendingPathComponent($0) }
+    }
+
+    private static var recentFileLists: [URL] {
+        let fm = FileManager.default
+        let base = home.appendingPathComponent("Library/Application Support/com.apple.sharedfilelist", isDirectory: true)
+        var urls = [
+            base.appendingPathComponent("com.apple.LSSharedFileList.RecentDocuments.sfl3"),
+            base.appendingPathComponent("com.apple.LSSharedFileList.RecentApplications.sfl3"),
+            base.appendingPathComponent("com.apple.LSSharedFileList.RecentHosts.sfl3")
+        ]
+        let perApp = base.appendingPathComponent("com.apple.LSSharedFileList.ApplicationRecentDocuments", isDirectory: true)
+        if let items = try? fm.contentsOfDirectory(at: perApp, includingPropertiesForKeys: nil) {
+            urls.append(contentsOf: items.filter { $0.pathExtension == "sfl3" })
+        }
+        return urls
+    }
+
+    private static var safariIsRunning: Bool {
+        NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == "com.apple.Safari" }
+    }
+
+    /// 删除一组文件；返回 (删除数量, 权限错误列表)
+    private static func remove(_ urls: [URL]) -> (deleted: Int, firstError: String?) {
+        var deleted = 0
+        var firstError: String?
+        for url in urls {
+            do {
+                try FileManager.default.removeItem(at: url)
+                deleted += 1
+            } catch {
+                let ns = error as NSError
+                // 文件不存在（4）/ 目录不存在（260）不算失败
+                if ns.domain == NSCocoaErrorDomain && (ns.code == 4 || ns.code == 260) { continue }
+                if firstError == nil { firstError = error.localizedDescription }
+            }
+        }
+        return (deleted, firstError)
+    }
+
+    private static func isPermissionError(_ message: String?) -> Bool {
+        guard let message = message else { return false }
+        return message.contains("权限") || message.contains("denied") || message.contains("permitted")
+    }
+
+    private static var safariDir: URL { home.appendingPathComponent("Library/Safari", isDirectory: true) }
+    private static var sharedFileListDir: URL {
+        home.appendingPathComponent("Library/Application Support/com.apple.sharedfilelist", isDirectory: true)
+    }
+
+    /// 目录能否读取；TCC 拦截时连目录都读不到
+    private static func accessError(_ dir: URL) -> String? {
+        do {
+            _ = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    static func clear(safariHistory: Bool, recentFiles: Bool) -> Result {
+        var lines: [String] = []
+        var needsFDA = false
+
+        if safariHistory {
+            if safariIsRunning {
+                lines.append("Safari 正在运行，先退出 Safari 再清空（运行中的记录会被写回）")
+            } else if accessError(safariDir) != nil {
+                lines.append("Safari 浏览记录：没有访问权限")
+                needsFDA = true
+            } else {
+                let outcome = remove(safariHistoryFiles)
+                if let error = outcome.firstError {
+                    lines.append("Safari 浏览记录：\(error)")
+                    if isPermissionError(error) { needsFDA = true }
+                } else if outcome.deleted > 0 {
+                    lines.append("Safari 浏览记录：已清空")
+                } else {
+                    lines.append("Safari 浏览记录：没有可清空的记录")
+                }
+            }
+        }
+
+        if recentFiles {
+            if accessError(sharedFileListDir) != nil {
+                lines.append("最近使用文件记录：没有访问权限")
+                needsFDA = true
+            } else {
+                let outcome = remove(recentFileLists)
+                if let error = outcome.firstError {
+                    lines.append("最近使用文件记录：\(error)")
+                    if isPermissionError(error) { needsFDA = true }
+                } else if outcome.deleted > 0 {
+                    lines.append("最近使用文件记录：已清空 \(outcome.deleted) 项（重启 Finder 后列表刷新）")
+                } else {
+                    lines.append("最近使用文件记录：没有可清空的记录")
+                }
+            }
+        }
+
+        if needsFDA {
+            lines.append("需要在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里勾选 mac-kit 后重试")
+        }
+        return Result(message: lines.joined(separator: "\n"), needsFullDiskAccess: needsFDA)
+    }
+
+    /// 只读自检：列出清空操作会碰到哪些文件，不删除任何东西
+    static func describeTargets() -> [String] {
+        var lines: [String] = []
+        lines.append("Safari 运行中: \(safariIsRunning ? "是" : "否")")
+        if let error = accessError(safariDir) {
+            lines.append("Safari 记录目录: 无法访问（\(error)）→ 需要完全磁盘访问权限")
+        } else {
+            lines.append("Safari 记录目录: 可访问")
+            for url in safariHistoryFiles {
+                let exists = FileManager.default.fileExists(atPath: url.path)
+                lines.append("  \(exists ? "存在" : "不存在")  \(url.lastPathComponent)")
+            }
+        }
+        lines.append("最近使用目录: \(sharedFileListDir.path)")
+        if let error = accessError(sharedFileListDir) {
+            lines.append("  无法访问（\(error)）")
+        } else {
+            let files = recentFileLists
+            let existing = files.filter { FileManager.default.fileExists(atPath: $0.path) }
+            lines.append("  可访问，待清理 \(existing.count) 项")
+            for url in existing.prefix(10) {
+                lines.append("    \(url.lastPathComponent)")
+            }
+        }
+        return lines
+    }
+}
+
 // MARK: - 界面数据模型
 
 final class MacKitModel: ObservableObject {
@@ -183,6 +329,31 @@ final class MacKitModel: ObservableObject {
     @Published var showMenuBarIcon: Bool = Preferences.showMenuBarIcon
     @Published var showDockIcon: Bool = Preferences.showDockIcon
 
+    // 设置窗口的侧栏选中项 / 清空确认弹窗
+    @Published var page: SettingsPage = .launcher
+    @Published var showClearConfirm: Bool = false
+
+    // 常用工具：清理记录
+    @Published var clearSafariHistory: Bool = true
+    @Published var clearRecentFiles: Bool = true
+    @Published var toolsStatus: String = ""
+    @Published var toolsNeedsFullDiskAccess: Bool = false
+    @Published var toolsLastRun: Date?
+
+    func clearSelectedRecords() {
+        guard clearSafariHistory || clearRecentFiles else {
+            toolsStatus = "先勾选要清理的选项"
+            return
+        }
+        let result = RecordCleaner.clear(
+            safariHistory: clearSafariHistory,
+            recentFiles: clearRecentFiles
+        )
+        toolsStatus = result.message
+        toolsNeedsFullDiskAccess = result.needsFullDiskAccess
+        toolsLastRun = Date()
+    }
+
     var onReload: () -> Void = {}
     var onToggleLogin: () -> Void = {}
     var onOpenConfig: () -> Void = {}
@@ -194,50 +365,266 @@ final class MacKitModel: ObservableObject {
 
 // MARK: - SwiftUI 界面
 
+enum SettingsPage: String, CaseIterable, Identifiable {
+    case launcher
+    case tools
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .launcher: return "快捷启动"
+        case .tools: return "常用工具"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .launcher: return "command"
+        case .tools: return "wand.and.stars"
+        }
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var model: MacKitModel
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            header
+    private var page: SettingsPage { model.page }
 
+    var body: some View {
+        HStack(spacing: 0) {
+            sidebar
+                .frame(width: 178)
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(width: 1)
+            detail
+        }
+        .frame(width: 720, height: 620)
+        .alert("清空这些记录？", isPresented: $model.showClearConfirm) {
+            Button("清空", role: .destructive) { model.clearSelectedRecords() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("Safari 浏览记录和最近使用文件记录，清空后无法恢复。")
+        }
+    }
+
+    // MARK: 侧栏
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            identity
+
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(SettingsPage.allCases) { item in
+                    navItem(item)
+                }
+            }
+
+            Text("⌥⌘, 随时打开设置")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .padding(.leading, 10)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 18)
+        .padding(.bottom, 16)
+        .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    private var identity: some View {
+        HStack(spacing: 10) {
+            if let icon = model.icon {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 34, height: 34)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .shadow(color: .black.opacity(0.2), radius: 3, x: 0, y: 1.5)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text("mac-kit")
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                Text("快捷键启动器")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 2)
+    }
+
+    private func navItem(_ item: SettingsPage) -> some View {
+        let selected = page == item
+        return Button {
+            model.page = item
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: item.symbol)
+                    .font(.system(size: 12, weight: .medium))
+                    .frame(width: 16)
+                Text(item.title)
+                    .font(.system(size: 13, weight: selected ? .medium : .regular))
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(selected ? AnyShapeStyle(.quaternary.opacity(0.9)) : AnyShapeStyle(Color.clear))
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(selected ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+    }
+
+    // MARK: 右侧内容
+
+    private var detail: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(page.title)
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+
+            switch page {
+            case .launcher:
+                launcherPage
+            case .tools:
+                toolsPage
+            }
+
+            Spacer(minLength: 0)
+
+            footer
+        }
+        .padding(.horizontal, 22)
+        .padding(.top, 18)
+        .padding(.bottom, 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var launcherPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
             sectionLabel("快捷键")
             shortcutList
 
             sectionLabel("设置")
             settingsRows
+        }
+    }
 
-            Spacer(minLength: 0)
+    @ViewBuilder
+    private var toolsPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            sectionLabel("清理记录")
 
-            Text(model.status)
+            VStack(spacing: 6) {
+                toolRow(
+                    "Safari 浏览记录",
+                    subtitle: "删除本机 Safari 历史记录，需要完全磁盘访问权限",
+                    symbol: "safari",
+                    isOn: $model.clearSafariHistory
+                )
+                toolRow(
+                    "最近使用文件记录",
+                    subtitle: "清空「最近使用」列表和各 App 的最近文件",
+                    symbol: "clock.arrow.circlepath",
+                    isOn: $model.clearRecentFiles
+                )
+            }
+
+            HStack {
+                Button {
+                    model.showClearConfirm = true
+                } label: {
+                    Label("一键清空记录", systemImage: "trash")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .disabled(!model.clearSafariHistory && !model.clearRecentFiles)
+
+                Spacer()
+            }
+
+            if !model.toolsStatus.isEmpty {
+                Text(model.toolsStatus)
+                    .font(.system(size: 11))
+                    .foregroundStyle(model.toolsNeedsFullDiskAccess ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.secondary))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if model.toolsNeedsFullDiskAccess {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "lock.shield")
+                        Text("这两个目录受系统保护，先在「隐私与安全性 → 完全磁盘访问权限」里勾选 mac-kit，然后重启 App")
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Button {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    } label: {
+                        Label("打开完全磁盘访问权限设置", systemImage: "gearshape")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
+            Text("清空后无法恢复；Finder 的最近列表重启 Finder 后刷新。")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func toolRow(_ title: String, subtitle: String, symbol: String, isOn: Binding<Bool>) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: symbol)
+                .font(.system(size: 13))
+                .frame(width: 18)
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 13))
+                Text(subtitle)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 8)
+            GlassSwitch(isOn: isOn)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(.quaternary.opacity(0.4))
+        )
+    }
+
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(page == .tools ? toolsFooterText : model.status)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
 
             actions
         }
-        .padding(24)
-        .frame(width: 460, height: 700)
     }
 
-    private var header: some View {
-        HStack(spacing: 14) {
-            if let icon = model.icon {
-                Image(nsImage: icon)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 56, height: 56)
-                    .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-                    .shadow(color: .black.opacity(0.25), radius: 6, x: 0, y: 3)
-            }
-            VStack(alignment: .leading, spacing: 3) {
-                Text("mac-kit")
-                    .font(.system(size: 18, weight: .semibold, design: .rounded))
-                Text("按住快捷键，直达常用 App")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-        }
+    private var toolsFooterText: String {
+        guard let last = model.toolsLastRun else { return "勾选后点「一键清空记录」" }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return "上次清空：\(formatter.string(from: last))"
     }
 
     private func sectionLabel(_ text: String) -> some View {
@@ -333,21 +720,23 @@ struct SettingsView: View {
 
     private var actions: some View {
         HStack(spacing: 10) {
-            Button {
-                model.onOpenConfig()
-            } label: {
-                Label("编辑配置", systemImage: "square.and.pencil")
-                    .font(.system(size: 12))
-            }
-            .buttonStyle(.bordered)
+            if page == .launcher {
+                Button {
+                    model.onOpenConfig()
+                } label: {
+                    Label("编辑配置", systemImage: "square.and.pencil")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.bordered)
 
-            Button {
-                model.onReload()
-            } label: {
-                Label("重新加载", systemImage: "arrow.clockwise")
-                    .font(.system(size: 12))
+                Button {
+                    model.onReload()
+                } label: {
+                    Label("重新加载", systemImage: "arrow.clockwise")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.bordered)
             }
-            .buttonStyle(.bordered)
 
             Spacer()
 
@@ -388,7 +777,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         self.model = model
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 700),
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 620),
             styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -955,7 +1344,7 @@ func runCheck() -> Never {
 // MARK: - 界面快照（--snapshot 输出 PNG，便于离线检查排版）
 
 @MainActor
-func renderSnapshot(to path: String) -> Never {
+func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
     _ = NSApplication.shared
     let model = MacKitModel()
     let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -975,7 +1364,16 @@ func renderSnapshot(to path: String) -> Never {
         model.status = "已注册 \(config.hotkeys.count)/\(config.hotkeys.count) 个快捷键"
     }
     model.icon = AppIconAsset.light
+    if page == .tools {
+        if CommandLine.arguments.contains("--fda") {
+            model.toolsStatus = "Safari 浏览记录：没有访问权限\n最近使用文件记录：没有访问权限"
+            model.toolsNeedsFullDiskAccess = true
+        } else {
+            model.toolsStatus = "Safari 浏览记录：已清空\n最近使用文件记录：已清空 12 项（重启 Finder 后列表刷新）"
+        }
+    }
 
+    model.page = page
     let view = SettingsView(model: model)
         .background(
             LinearGradient(
@@ -1000,6 +1398,15 @@ func renderSnapshot(to path: String) -> Never {
     exit(0)
 }
 
+// MARK: - 清理目标自检（--tools-check，只读）
+
+func runToolsCheck() -> Never {
+    for line in RecordCleaner.describeTargets() {
+        print(line)
+    }
+    exit(0)
+}
+
 // MARK: - 入口
 
 let app = NSApplication.shared
@@ -1007,10 +1414,20 @@ if CommandLine.arguments.contains("--check") {
     runCheck()
 }
 
+if CommandLine.arguments.contains("--tools-check") {
+    runToolsCheck()
+}
+
 if let index = CommandLine.arguments.firstIndex(of: "--snapshot"), CommandLine.arguments.count > index + 1 {
     let path = CommandLine.arguments[index + 1]
+    var page = SettingsPage.launcher
+    if let p = CommandLine.arguments.firstIndex(of: "--page"),
+       CommandLine.arguments.count > p + 1,
+       let parsed = SettingsPage(rawValue: CommandLine.arguments[p + 1]) {
+        page = parsed
+    }
     Task { @MainActor in
-        renderSnapshot(to: path)
+        renderSnapshot(to: path, page: page)
     }
     RunLoop.main.run()
 }

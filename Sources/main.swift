@@ -163,6 +163,57 @@ enum Preferences {
         get { UserDefaults.standard.bool(forKey: dockKey) }
         set { UserDefaults.standard.set(newValue, forKey: dockKey) }
     }
+
+    private static let orderKey = "sidebarOrder"
+
+    /// 侧栏顺序；读不到或数量不对时回落到默认顺序
+    static var sidebarOrder: [SettingsPage] {
+        get {
+            let raw = UserDefaults.standard.stringArray(forKey: orderKey) ?? []
+            let items = raw.compactMap { SettingsPage(rawValue: $0) }
+            let missing = SettingsPage.allCases.filter { !items.contains($0) }
+            let order = items + missing
+            return order.count == SettingsPage.allCases.count ? order : SettingsPage.allCases
+        }
+        set {
+            UserDefaults.standard.set(newValue.map { $0.rawValue }, forKey: orderKey)
+        }
+    }
+}
+
+// MARK: - 清理范围
+
+enum HistoryRange: String, CaseIterable, Identifiable {
+    case today
+    case twoDays
+    case week
+    case month
+    case all
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .today: return "今天"
+        case .twoDays: return "今天和昨天"
+        case .week: return "一周"
+        case .month: return "一个月"
+        case .all: return "全部"
+        }
+    }
+
+    /// 起始时间；nil 表示全部
+    var cutoff: Date? {
+        let calendar = Calendar.current
+        let startOfToday = calendar.startOfDay(for: Date())
+        switch self {
+        case .today: return startOfToday
+        case .twoDays: return calendar.date(byAdding: .day, value: -1, to: startOfToday)
+        case .week: return calendar.date(byAdding: .day, value: -7, to: startOfToday)
+        case .month: return calendar.date(byAdding: .month, value: -1, to: startOfToday)
+        case .all: return nil
+        }
+    }
 }
 
 // MARK: - 记录清理（Safari 浏览记录 / 最近使用文件）
@@ -237,27 +288,92 @@ enum RecordCleaner {
         }
     }
 
-    static func clear(safariHistory: Bool, recentFiles: Bool) -> Result {
+    private static var historyDB: URL { safariDir.appendingPathComponent("History.db") }
+
+    static func sqlite(_ sql: String, db: URL? = nil) -> (output: String?, error: String?) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        process.arguments = [(db ?? historyDB).path, sql]
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        do {
+            try process.run()
+        } catch {
+            return (nil, error.localizedDescription)
+        }
+        process.waitUntilExit()
+        let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if process.terminationStatus != 0 {
+            return (out, (err?.isEmpty == false) ? err : "sqlite3 退出码 \(process.terminationStatus)")
+        }
+        return (out, nil)
+    }
+
+    /// 按时间范围删 Safari 历史（visit_time 用 2001-01-01 起的秒数）
+    private static func clearSafariHistory(range: HistoryRange) -> (message: String, needsFDA: Bool) {
+        if safariIsRunning {
+            return ("Safari 浏览记录：Safari 正在运行，先退出 Safari（运行中的记录会被写回）", false)
+        }
+        if accessError(safariDir) != nil {
+            return ("Safari 浏览记录：没有访问权限", true)
+        }
+
+        if range == .all {
+            let outcome = remove(safariHistoryFiles)
+            if let error = outcome.firstError {
+                return ("Safari 浏览记录：\(error)", isPermissionError(error))
+            }
+            return outcome.deleted > 0
+                ? ("Safari 浏览记录：已全部清空", false)
+                : ("Safari 浏览记录：没有可清空的记录", false)
+        }
+
+        guard FileManager.default.fileExists(atPath: historyDB.path) else {
+            return ("Safari 浏览记录：没有可清空的记录", false)
+        }
+        guard let cutoff = range.cutoff else {
+            return ("Safari 浏览记录：范围无效", false)
+        }
+        let (deleted, deleteError) = deleteHistory(db: historyDB, cutoff: cutoff)
+        if let deleteError = deleteError {
+            return ("Safari 浏览记录：清理失败（\(deleteError)）", isPermissionError(deleteError))
+        }
+        guard deleted > 0 else {
+            return ("Safari 浏览记录：\(range.title)没有记录", false)
+        }
+        return ("Safari 浏览记录：已清空「\(range.title)」的 \(deleted) 条", false)
+    }
+
+    /// 删除 visit_time >= cutoff 的记录，并清掉因此变空的 history_items
+    static func deleteHistory(db: URL, cutoff: Date) -> (deleted: Int, error: String?) {
+        let stamp = Int(cutoff.timeIntervalSinceReferenceDate.rounded())
+        let (countText, countError) = sqlite("SELECT COUNT(*) FROM history_visits WHERE visit_time >= \(stamp);", db: db)
+        if let countError = countError { return (0, countError) }
+        let count = Int(countText ?? "") ?? 0
+        guard count > 0 else { return (0, nil) }
+        let (_, deleteError) = sqlite("""
+        BEGIN;
+        DELETE FROM history_visits WHERE visit_time >= \(stamp);
+        DELETE FROM history_items WHERE id NOT IN (SELECT DISTINCT history_item FROM history_visits);
+        COMMIT;
+        """, db: db)
+        if let deleteError = deleteError { return (count, deleteError) }
+        return (count, nil)
+    }
+
+    static func clear(safariHistory: Bool, recentFiles: Bool, range: HistoryRange) -> Result {
         var lines: [String] = []
         var needsFDA = false
 
         if safariHistory {
-            if safariIsRunning {
-                lines.append("Safari 正在运行，先退出 Safari 再清空（运行中的记录会被写回）")
-            } else if accessError(safariDir) != nil {
-                lines.append("Safari 浏览记录：没有访问权限")
-                needsFDA = true
-            } else {
-                let outcome = remove(safariHistoryFiles)
-                if let error = outcome.firstError {
-                    lines.append("Safari 浏览记录：\(error)")
-                    if isPermissionError(error) { needsFDA = true }
-                } else if outcome.deleted > 0 {
-                    lines.append("Safari 浏览记录：已清空")
-                } else {
-                    lines.append("Safari 浏览记录：没有可清空的记录")
-                }
-            }
+            let result = clearSafariHistory(range: range)
+            lines.append(result.message)
+            needsFDA = needsFDA || result.needsFDA
         }
 
         if recentFiles {
@@ -278,7 +394,7 @@ enum RecordCleaner {
         }
 
         if needsFDA {
-            lines.append("需要在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里勾选 mac-kit 后重试")
+            lines.append("需要在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里勾选 MacKit 后重试")
         }
         return Result(message: lines.joined(separator: "\n"), needsFullDiskAccess: needsFDA)
     }
@@ -330,11 +446,38 @@ final class MacKitModel: ObservableObject {
     @Published var showDockIcon: Bool = Preferences.showDockIcon
 
     // 设置窗口的侧栏选中项 / 清空确认弹窗
-    @Published var page: SettingsPage = .launcher
+    @Published var page: SettingsPage = .tools
     @Published var showClearConfirm: Bool = false
+
+    // 侧栏顺序（可拖动），记住用户排的次序
+    @Published var pageOrder: [SettingsPage] = Preferences.sidebarOrder {
+        didSet { Preferences.sidebarOrder = pageOrder }
+    }
+    @Published var draggingPage: SettingsPage?
+    private var dragStartIndex = 0
+    private let sidebarRowHeight: CGFloat = 34
+
+    func dragSidebarItem(_ item: SettingsPage, translation: CGFloat) {
+        guard let index = pageOrder.firstIndex(of: item) else { return }
+        if draggingPage != item {
+            draggingPage = item
+            dragStartIndex = index
+        }
+        let steps = Int((translation / sidebarRowHeight).rounded())
+        let target = min(max(dragStartIndex + steps, 0), pageOrder.count - 1)
+        guard target != index else { return }
+        withAnimation(.easeInOut(duration: 0.16)) {
+            pageOrder.move(fromOffsets: IndexSet(integer: index), toOffset: target > index ? target + 1 : target)
+        }
+    }
+
+    func endSidebarDrag() {
+        draggingPage = nil
+    }
 
     // 常用工具：清理记录
     @Published var clearSafariHistory: Bool = true
+    @Published var historyRange: HistoryRange = .today
     @Published var clearRecentFiles: Bool = true
     @Published var toolsStatus: String = ""
     @Published var toolsNeedsFullDiskAccess: Bool = false
@@ -347,7 +490,8 @@ final class MacKitModel: ObservableObject {
         }
         let result = RecordCleaner.clear(
             safariHistory: clearSafariHistory,
-            recentFiles: clearRecentFiles
+            recentFiles: clearRecentFiles,
+            range: historyRange
         )
         toolsStatus = result.message
         toolsNeedsFullDiskAccess = result.needsFullDiskAccess
@@ -416,8 +560,15 @@ struct SettingsView: View {
             identity
 
             VStack(alignment: .leading, spacing: 4) {
-                ForEach(SettingsPage.allCases) { item in
+                ForEach(model.pageOrder) { item in
                     navItem(item)
+                        .gesture(
+                            DragGesture(minimumDistance: 3)
+                                .onChanged { value in
+                                    model.dragSidebarItem(item, translation: value.translation.height)
+                                }
+                                .onEnded { _ in model.endSidebarDrag() }
+                        )
                 }
             }
 
@@ -478,6 +629,7 @@ struct SettingsView: View {
             .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
         }
         .buttonStyle(.plain)
+        .opacity(model.draggingPage == item ? 0.45 : 1)
         .foregroundStyle(selected ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
     }
 
@@ -522,12 +674,14 @@ struct SettingsView: View {
             sectionLabel("清理记录")
 
             VStack(spacing: 6) {
-                toolRow(
+                toolCard(
                     "Safari 浏览记录",
                     subtitle: "删除本机 Safari 历史记录，需要完全磁盘访问权限",
                     symbol: "safari",
                     isOn: $model.clearSafariHistory
-                )
+                ) {
+                    historyRangeRow
+                }
                 toolRow(
                     "最近使用文件记录",
                     subtitle: "清空「最近使用」列表和各 App 的最近文件",
@@ -562,7 +716,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(alignment: .top, spacing: 6) {
                         Image(systemName: "lock.shield")
-                        Text("这两个目录受系统保护，先在「隐私与安全性 → 完全磁盘访问权限」里勾选 mac-kit，然后重启 App")
+                        Text("这两个目录受系统保护，先在「隐私与安全性 → 完全磁盘访问权限」里勾选 MacKit，然后重启 App")
                     }
                     .font(.system(size: 11))
                     .foregroundStyle(.orange)
@@ -586,7 +740,78 @@ struct SettingsView: View {
         }
     }
 
+    private var historyRangeRow: some View {
+        HStack(spacing: 0) {
+            Text("范围")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 0)
+
+            HStack(spacing: 2) {
+                ForEach(HistoryRange.allCases) { range in
+                    let selected = model.historyRange == range
+                    Button {
+                        model.historyRange = range
+                    } label: {
+                        Text(range.title)
+                            .font(.system(size: 11, weight: selected ? .medium : .regular))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(selected ? AnyShapeStyle(Color.primary.opacity(0.14)) : AnyShapeStyle(Color.clear))
+                            )
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(selected ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                }
+            }
+            .padding(3)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Color.primary.opacity(0.06))
+            )
+
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 30)
+        .padding(.bottom, 2)
+        .transition(.opacity)
+    }
+
+    private func toolCard<Extra: View>(
+        _ title: String,
+        subtitle: String,
+        symbol: String,
+        isOn: Binding<Bool>,
+        @ViewBuilder extra: () -> Extra
+    ) -> some View {
+        VStack(spacing: 8) {
+            toolRowContent(title, subtitle: subtitle, symbol: symbol, isOn: isOn)
+            if isOn.wrappedValue {
+                extra()
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(.quaternary.opacity(0.4))
+        )
+    }
+
     private func toolRow(_ title: String, subtitle: String, symbol: String, isOn: Binding<Bool>) -> some View {
+        toolRowContent(title, subtitle: subtitle, symbol: symbol, isOn: isOn)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(.quaternary.opacity(0.4))
+            )
+    }
+
+    private func toolRowContent(_ title: String, subtitle: String, symbol: String, isOn: Binding<Bool>) -> some View {
         HStack(spacing: 12) {
             Image(systemName: symbol)
                 .font(.system(size: 13))
@@ -602,12 +827,6 @@ struct SettingsView: View {
             Spacer(minLength: 8)
             GlassSwitch(isOn: isOn)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(.quaternary.opacity(0.4))
-        )
     }
 
     private var footer: some View {
@@ -1427,7 +1646,7 @@ func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
             model.toolsStatus = "Safari 浏览记录：没有访问权限\n最近使用文件记录：没有访问权限"
             model.toolsNeedsFullDiskAccess = true
         } else {
-            model.toolsStatus = "Safari 浏览记录：已清空\n最近使用文件记录：已清空 12 项（重启 Finder 后列表刷新）"
+            model.toolsStatus = "Safari 浏览记录：已清空「今天」的 37 条\n最近使用文件记录：已清空 12 项（重启 Finder 后列表刷新）"
         }
     }
 
@@ -1477,6 +1696,54 @@ func runLoginToggle(_ action: String) -> Never {
     exit(0)
 }
 
+// MARK: - 时间范围自检（--range-test，用临时库验证，不动真实历史）
+
+func runRangeTest() -> Never {
+    let fm = FileManager.default
+    let base = fm.temporaryDirectory.appendingPathComponent("mac-kit-range-base.db")
+    try? fm.removeItem(at: base)
+
+    _ = RecordCleaner.sqlite("""
+    CREATE TABLE history_items (id INTEGER PRIMARY KEY, url TEXT);
+    CREATE TABLE history_visits (id INTEGER PRIMARY KEY, history_item INTEGER, visit_time REAL);
+    """, db: base)
+
+    let startOfToday = Calendar.current.startOfDay(for: Date())
+    let samples: [(String, TimeInterval)] = [
+        ("今天 +1h", 3600),
+        ("昨天 -5h", -5 * 3600),
+        ("3 天前", -3 * 86400),
+        ("10 天前", -10 * 86400),
+        ("20 天前", -20 * 86400),
+        ("40 天前", -40 * 86400)
+    ]
+    let visits = samples.enumerated().map { index, sample in
+        let time = startOfToday.addingTimeInterval(sample.1).timeIntervalSinceReferenceDate
+        return "(\(index + 1), \(index + 1), \(time))"
+    }
+    let items = samples.enumerated().map { "(\($0.offset + 1), 'https://example.com/\($0.offset)')" }
+    _ = RecordCleaner.sqlite("""
+    INSERT INTO history_visits (id, history_item, visit_time) VALUES \(visits.joined(separator: ","));
+    INSERT INTO history_items (id, url) VALUES \(items.joined(separator: ","));
+    """, db: base)
+
+    print("样本: " + samples.map { $0.0 }.joined(separator: "、"))
+    for range in HistoryRange.allCases where range != .all {
+        let work = fm.temporaryDirectory.appendingPathComponent("mac-kit-range-test.db")
+        try? fm.removeItem(at: work)
+        try? fm.copyItem(at: base, to: work)
+        guard let cutoff = range.cutoff else { continue }
+        let (deleted, error) = RecordCleaner.deleteHistory(db: work, cutoff: cutoff)
+        let (left, _) = RecordCleaner.sqlite("SELECT COUNT(*) FROM history_visits;", db: work)
+        print("\(range.title): 删除 \(deleted) 条，剩余 \(left ?? "?") 条\(error == nil ? "" : "，错误: \(error!)")")
+        try? fm.removeItem(at: work)
+    }
+    let (all, _) = RecordCleaner.sqlite("SELECT COUNT(*) FROM history_visits;", db: base)
+    print("全部: 共 \(all ?? "?") 条")
+    try? fm.removeItem(at: base)
+    exit(0)
+}
+
 // MARK: - 清理目标自检（--tools-check，只读）
 
 func runToolsCheck() -> Never {
@@ -1495,6 +1762,10 @@ if CommandLine.arguments.contains("--check") {
 
 if CommandLine.arguments.contains("--tools-check") {
     runToolsCheck()
+}
+
+if CommandLine.arguments.contains("--range-test") {
+    runRangeTest()
 }
 
 for flag in ["--login-on", "--login-off", "--login-status"] where CommandLine.arguments.contains(flag) {

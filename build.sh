@@ -1,10 +1,10 @@
 #!/bin/bash
-# 构建 mac-kit.app
+# 构建 MacKit.app
 # 用法：./build.sh [安装目录]   默认安装到 /Applications
 set -euo pipefail
 
 cd "$(dirname "$0")"
-APP_NAME="mac-kit"
+APP_NAME="MacKit"
 BUILD_DIR="build"
 BUNDLE="$BUILD_DIR/$APP_NAME.app"
 

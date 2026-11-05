@@ -1,4 +1,4 @@
-# mac-kit
+# MacKit
 
 一个 macOS 菜单栏小工具：**用全局快捷键打开（或切换到）不同的 App**。
 
@@ -7,6 +7,7 @@
 - 用 Carbon `RegisterEventHotKey` 注册全局热键，**不需要辅助功能（Accessibility）权限**
 - 设置窗口左侧是侧栏：**快捷启动**（全局快捷键）和 **常用工具**（一键清空记录）
 - 常用工具：清空 Safari 浏览记录、最近使用文件记录，可分别勾选
+- 开机自启时只驻留菜单栏；**手动打开（Finder 双击 / Dock / `open`）会直接弹出设置窗口**
 - 图标与设置窗口都按 macOS 26/27 的 Liquid Glass 风格重新设计
 - 配置是一个 JSON 文件，改完点「重新加载配置」即生效
 
@@ -32,7 +33,7 @@
 
 ## 设置窗口
 
-菜单栏图标 →「偏好设置…」（⌘,）。窗口分成侧栏和右侧内容两块，侧栏切换两个页面。
+菜单栏图标 →「偏好设置…」（⌘,），或者直接手动打开 App。窗口分成侧栏和右侧内容两块，侧栏切换两个页面。
 
 **快捷启动**（默认页）：
 
@@ -98,12 +99,14 @@
 ## 命令行
 
 ```bash
-APP=/Applications/mac-kit.app/Contents/MacOS/mac-kit
+APP=/Applications/MacKit.app/Contents/MacOS/MacKit
 
 $APP --check                 # 检查每个快捷键能否注册、目标能否解析、当前图标选型
 $APP --open Finder           # 单独测试某个 target 能否被打开
 $APP --settings              # 启动并直接打开设置窗口
 $APP --tools-check           # 只读检查清理目标（列出文件、报告是否有完全磁盘访问权限）
+$APP --login-status          # 查看是否已装开机自启
+$APP --login-on/--login-off  # 安装 / 移除开机自启（LaunchAgent）
 $APP --snapshot out.png      # 离屏渲染设置界面（检查排版），加 --page tools 渲染常用工具页
 ```
 
@@ -133,7 +136,7 @@ Safari 记录目录: 可访问
 ## 构建
 
 ```bash
-cd mac-kit
+cd mac-kit   # 仓库目录名仍是 mac-kit
 ./build.sh              # 构建并安装到 /Applications
 ./build.sh none         # 只构建
 ```
@@ -141,7 +144,7 @@ cd mac-kit
 重新构建前先退出旧实例：
 
 ```bash
-pkill -f 'MacOS/mac-kit'
+pkill -f 'MacOS/MacKit'
 ```
 
 ## 重新生成图标
@@ -160,8 +163,9 @@ done
 ## 卸载
 
 ```bash
-pkill -f 'MacOS/mac-kit'
-rm -rf /Applications/mac-kit.app
+pkill -f 'MacOS/MacKit'
+/Applications/MacKit.app/Contents/MacOS/MacKit --login-off   # 先卸掉开机自启
+rm -rf /Applications/MacKit.app
 rm -rf ~/Library/Application\ Support/mac-kit
 rm -f ~/Library/Logs/mac-kit.log
 ```
@@ -176,5 +180,6 @@ rm -f ~/Library/Logs/mac-kit.log
 - 设置窗口是 `NSHostingView(SwiftUI)` 套在 `NSGlassEffectView` 里，窗口 `titlebarAppearsTransparent` + `fullSizeContentView`
 - 侧栏选中项、清空确认弹窗都存在 `MacKitModel`（`@Published`）里，没有用 `@State`——纯 Command Line Tools 环境没有 SwiftUI 宏插件，`@State` 编译不过
 - 菜单栏图标与 Dock 图标分别由 `NSStatusItem.isVisible` 和 `NSApp.setActivationPolicy(_:)` 控制，状态存 `UserDefaults`
+- 开机自启用自己写的 LaunchAgent（`~/Library/LaunchAgents/com.kaix.mac-kit.plist`，`RunAtLoad` + `--login` 参数），不用 `SMAppService`：登录时靠这个参数判断「不是用户手动打开的」，就不弹设置窗口；再次启动已在运行的实例走 `applicationShouldHandleReopen`
 - 记录清理只看两处：`~/Library/Safari/History.db*` 和 `~/Library/Application Support/com.apple.sharedfilelist/` 下的 `RecentDocuments` / `RecentApplications` / 各 App 的 `.sfl3`；TCC 拦截时目录本身读不到，据此判定需要完全磁盘访问权限
 - 保留热键 `⌥⌘,`（Carbon 注册，id `0xF000`）用于兜底打开设置窗口

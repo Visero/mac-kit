@@ -445,7 +445,7 @@ struct SettingsView: View {
                     .shadow(color: .black.opacity(0.2), radius: 3, x: 0, y: 1.5)
             }
             VStack(alignment: .leading, spacing: 1) {
-                Text("mac-kit")
+                Text("MacKit")
                     .font(.system(size: 13, weight: .semibold, design: .rounded))
                 Text("快捷键启动器")
                     .font(.system(size: 10))
@@ -782,7 +782,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "mac-kit"
+        window.title = "MacKit"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
@@ -901,6 +901,60 @@ private let hotKeyCallback: EventHandlerUPP = { _, event, userData in
     return noErr
 }
 
+// MARK: - 开机自启（LaunchAgent）
+
+enum LoginAgent {
+    static let label = "com.kaix.mac-kit"
+
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+
+    static var isEnabled: Bool {
+        FileManager.default.fileExists(atPath: plistURL.path)
+    }
+
+    /// 拉起自己时带上 --login，登录时不弹设置窗口
+    static func install() throws {
+        // 清掉旧版 SMAppService 的注册，避免两套自启同时生效
+        if #available(macOS 13.0, *), SMAppService.mainApp.status == .enabled {
+            try? SMAppService.mainApp.unregister()
+        }
+        let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
+        let plist: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": [executable.path, "--login"],
+            "RunAtLoad": true,
+            "ProcessType": "Interactive",
+            "LimitLoadToSessionType": "Aqua"
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try FileManager.default.createDirectory(
+            at: plistURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: plistURL)
+        // 已经加载过就先卸载，下次登录生效；不立即 bootstrap，避免当场再起一个实例
+        launchctl(["bootout", "gui/\(getuid())/\(label)"])
+    }
+
+    static func remove() {
+        launchctl(["bootout", "gui/\(getuid())/\(label)"])
+        try? FileManager.default.removeItem(at: plistURL)
+    }
+
+    private static func launchctl(_ args: [String]) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = args
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+    }
+}
+
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -922,8 +976,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return dir.appendingPathComponent("config.json")
     }()
 
+    /// 开机自启由 LaunchAgent 带 --login 拉起；手动打开（Finder / Dock / open）不会有这个参数
+    private var launchedAtLogin: Bool { CommandLine.arguments.contains("--login") }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        // 已在运行时再点 Dock 图标 / 再次打开，把设置窗口带到前台
+        openSettings()
+        return true
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        Log.write("启动 mac-kit \(Bundle.main.bundleIdentifier ?? "-")")
+        Log.write("启动 MacKit \(Bundle.main.bundleIdentifier ?? "-")")
         applyIcon(for: NSApp.effectiveAppearance)
         observeAppearance()
         setupStatusItem()
@@ -934,7 +997,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         loadConfig()
         rebuildMenu()
 
-        if CommandLine.arguments.contains("--settings") {
+        let forceSettings = CommandLine.arguments.contains("--settings")
+        if forceSettings || !launchedAtLogin {
+            Log.write("手动打开，显示设置窗口")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 self?.openSettings()
             }
@@ -991,10 +1056,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            let image = NSImage(systemSymbolName: "command", accessibilityDescription: "mac-kit")
+            let image = NSImage(systemSymbolName: "command", accessibilityDescription: "MacKit")
             image?.isTemplate = true
             button.image = image
-            button.toolTip = "mac-kit — 快捷键启动 App"
+            button.toolTip = "MacKit — 快捷键启动 App"
         }
     }
 
@@ -1222,7 +1287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(loginItem)
 
         menu.addItem(.separator())
-        menu.addItem(item("退出 mac-kit", #selector(quit), "", key: "q"))
+        menu.addItem(item("退出 MacKit", #selector(quit), "", key: "q"))
 
         for entry in menu.items where entry.action != nil {
             entry.target = self
@@ -1270,30 +1335,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: 开机自启
 
-    private func isLoginItemEnabled() -> Bool {
-        if #available(macOS 13.0, *) {
-            return SMAppService.mainApp.status == .enabled
-        }
-        return false
-    }
+    private func isLoginItemEnabled() -> Bool { LoginAgent.isEnabled }
 
     private func toggleLoginItem() {
-        if #available(macOS 13.0, *) {
+        if LoginAgent.isEnabled {
+            LoginAgent.remove()
+            lastMessage = "已取消开机自启"
+        } else {
             do {
-                if SMAppService.mainApp.status == .enabled {
-                    try SMAppService.mainApp.unregister()
-                    lastMessage = "已取消开机自启"
-                } else {
-                    try SMAppService.mainApp.register()
-                    lastMessage = "已开启开机自启"
-                }
+                try LoginAgent.install()
+                lastMessage = "已开启开机自启"
             } catch {
                 lastMessage = "设置开机自启失败: \(error.localizedDescription)"
             }
-            Log.write(lastMessage)
-            syncModel()
-            rebuildMenu()
         }
+        Log.write(lastMessage)
+        syncModel()
+        rebuildMenu()
     }
 
     @objc private func toggleLoginItemFromMenu() {
@@ -1398,6 +1456,27 @@ func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
     exit(0)
 }
 
+// MARK: - 登录项自检（--login-on / --login-off / --login-status）
+
+func runLoginToggle(_ action: String) -> Never {
+    switch action {
+    case "--login-on":
+        do {
+            try LoginAgent.install()
+            print("已写入 \(LoginAgent.plistURL.path)")
+        } catch {
+            print("失败: \(error.localizedDescription)")
+        }
+    case "--login-off":
+        LoginAgent.remove()
+        print("已移除 \(LoginAgent.plistURL.path)")
+    default:
+        break
+    }
+    print("自启状态: \(LoginAgent.isEnabled ? "开启" : "关闭")")
+    exit(0)
+}
+
 // MARK: - 清理目标自检（--tools-check，只读）
 
 func runToolsCheck() -> Never {
@@ -1416,6 +1495,10 @@ if CommandLine.arguments.contains("--check") {
 
 if CommandLine.arguments.contains("--tools-check") {
     runToolsCheck()
+}
+
+for flag in ["--login-on", "--login-off", "--login-status"] where CommandLine.arguments.contains(flag) {
+    runLoginToggle(flag)
 }
 
 if let index = CommandLine.arguments.firstIndex(of: "--snapshot"), CommandLine.arguments.count > index + 1 {

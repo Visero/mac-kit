@@ -1,0 +1,1040 @@
+import Cocoa
+import Carbon.HIToolbox
+import ServiceManagement
+import SwiftUI
+
+// MARK: - 配置模型
+
+struct HotkeyBinding: Codable {
+    var key: String
+    var modifiers: [String]
+    var target: String
+}
+
+struct Config: Codable {
+    var hotkeys: [HotkeyBinding]
+}
+
+// MARK: - 键码表（US 布局虚拟键码）
+
+enum KeyCodes {
+    static let map: [String: Int] = [
+        "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
+        "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17,
+        "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "equal": 24, "=": 24,
+        "9": 25, "7": 26, "minus": 27, "-": 27, "8": 28, "0": 29,
+        "rightbracket": 30, "]": 30, "o": 31, "u": 32, "leftbracket": 33, "[": 33,
+        "i": 34, "p": 35, "return": 36, "enter": 36, "l": 37, "j": 38,
+        "quote": 39, "'": 39, "k": 40, "semicolon": 41, ";": 41,
+        "backslash": 42, "\\": 42, "comma": 43, ",": 43, "slash": 44, "/": 44,
+        "n": 45, "m": 46, "period": 47, ".": 47, "tab": 48, "space": 49,
+        "grave": 50, "`": 50, "delete": 51, "backspace": 51, "escape": 53,
+        "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
+        "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+        "left": 123, "right": 124, "down": 125, "up": 126,
+        "home": 115, "end": 119, "pageup": 116, "pagedown": 121
+    ]
+
+    static func carbonModifiers(_ names: [String]) -> UInt32 {
+        var mods: UInt32 = 0
+        for name in names {
+            switch name.lowercased() {
+            case "command", "cmd", "⌘": mods |= UInt32(cmdKey)
+            case "option", "alt", "opt", "⌥": mods |= UInt32(optionKey)
+            case "control", "ctrl", "⌃": mods |= UInt32(controlKey)
+            case "shift", "⇧": mods |= UInt32(shiftKey)
+            default: break
+            }
+        }
+        return mods
+    }
+
+    static func display(_ names: [String]) -> String {
+        var out = ""
+        for name in names.map({ $0.lowercased() }) {
+            switch name {
+            case "command", "cmd", "⌘": out += "⌘"
+            case "option", "alt", "opt", "⌥": out += "⌥"
+            case "control", "ctrl", "⌃": out += "⌃"
+            case "shift", "⇧": out += "⇧"
+            default: break
+            }
+        }
+        return out
+    }
+
+    static func label(_ binding: HotkeyBinding) -> String {
+        "\(display(binding.modifiers))\(binding.key.uppercased())"
+    }
+}
+
+// MARK: - 日志
+
+enum Log {
+    static let url = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/mac-kit.log")
+
+    static func write(_ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let line = "[\(formatter.string(from: Date()))] \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url)
+        }
+        FileHandle.standardError.write(data)
+    }
+}
+
+// MARK: - 应用查找
+
+enum AppResolver {
+    static let appDirs = [
+        "/Applications",
+        "/System/Applications",
+        "/Applications/Utilities",
+        "/System/Applications/Utilities",
+        "/System/Library/CoreServices",
+        NSHomeDirectory() + "/Applications"
+    ]
+
+    /// target 支持三种写法：应用名、bundle id、完整路径
+    static func resolve(_ target: String) -> URL? {
+        let trimmed = target.trimmingCharacters(in: .whitespaces)
+
+        if trimmed.contains("/") {
+            let path = (trimmed as NSString).expandingTildeInPath
+            return FileManager.default.fileExists(atPath: path) ? URL(fileURLWithPath: path) : nil
+        }
+
+        if trimmed.contains(".") {
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: trimmed) {
+                return url
+            }
+        }
+
+        let name = trimmed.hasSuffix(".app") ? String(trimmed.dropLast(4)) : trimmed
+        for dir in appDirs {
+            let path = "\(dir)/\(name).app"
+            if FileManager.default.fileExists(atPath: path) {
+                return URL(fileURLWithPath: path)
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - 图标（亮/暗两套，随系统外观切换）
+
+enum AppIconAsset {
+    static func named(_ name: String) -> NSImage? {
+        guard let url = Bundle.main.url(forResource: name, withExtension: "icns") else { return nil }
+        return NSImage(contentsOf: url)
+    }
+
+    static var light: NSImage? { named("AppIcon") }
+    static var dark: NSImage? { named("AppIcon-Dark") }
+
+    static func forAppearance(_ appearance: NSAppearance) -> NSImage? {
+        let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        return isDark ? (dark ?? light) : (light ?? dark)
+    }
+}
+
+// MARK: - 外观偏好（UserDefaults）
+
+enum Preferences {
+    private static let menuBarKey = "showMenuBarIcon"
+    private static let dockKey = "showDockIcon"
+
+    static var showMenuBarIcon: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: menuBarKey) == nil { return true }
+            return UserDefaults.standard.bool(forKey: menuBarKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: menuBarKey) }
+    }
+
+    static var showDockIcon: Bool {
+        get { UserDefaults.standard.bool(forKey: dockKey) }
+        set { UserDefaults.standard.set(newValue, forKey: dockKey) }
+    }
+}
+
+// MARK: - 界面数据模型
+
+final class MacKitModel: ObservableObject {
+    struct Row: Identifiable {
+        let id = UUID()
+        let keys: String
+        let target: String
+        let resolved: String
+        let ok: Bool
+    }
+
+    @Published var rows: [Row] = []
+    @Published var status: String = "就绪"
+    @Published var loginItemEnabled: Bool = false
+    @Published var icon: NSImage? = NSApp.applicationIconImage
+    @Published var showMenuBarIcon: Bool = Preferences.showMenuBarIcon
+    @Published var showDockIcon: Bool = Preferences.showDockIcon
+
+    var onReload: () -> Void = {}
+    var onToggleLogin: () -> Void = {}
+    var onOpenConfig: () -> Void = {}
+    var onQuit: () -> Void = {}
+    var onCloseWindow: () -> Void = {}
+    var onToggleMenuBarIcon: () -> Void = {}
+    var onToggleDockIcon: () -> Void = {}
+}
+
+// MARK: - SwiftUI 界面
+
+struct SettingsView: View {
+    @ObservedObject var model: MacKitModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            header
+
+            sectionLabel("快捷键")
+            shortcutList
+
+            sectionLabel("设置")
+            settingsRows
+
+            Spacer(minLength: 0)
+
+            Text(model.status)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+
+            actions
+        }
+        .padding(24)
+        .frame(width: 460, height: 700)
+    }
+
+    private var header: some View {
+        HStack(spacing: 14) {
+            if let icon = model.icon {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 56, height: 56)
+                    .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+                    .shadow(color: .black.opacity(0.25), radius: 6, x: 0, y: 3)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text("mac-kit")
+                    .font(.system(size: 18, weight: .semibold, design: .rounded))
+                Text("按住快捷键，直达常用 App")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+    }
+
+    private func sectionLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .textCase(.uppercase)
+            .kerning(0.6)
+    }
+
+    @ViewBuilder
+    private var shortcutList: some View {
+        let content = VStack(spacing: 6) {
+            ForEach(model.rows) { row in
+                HStack(spacing: 12) {
+                    Text(row.keys)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .frame(minWidth: 58, minHeight: 24)
+                        .background(
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(.quaternary)
+                        )
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(row.target)
+                            .font(.system(size: 13))
+                        Text(row.resolved)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: row.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(row.ok ? Color.green : Color.orange)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(.quaternary.opacity(0.4))
+                )
+            }
+        }
+
+        if model.rows.count > 8 {
+            ScrollView { content }
+                .frame(maxHeight: 360)
+        } else {
+            content
+        }
+    }
+
+    private var settingsRows: some View {
+        VStack(spacing: 6) {
+            settingRow("登录时自动启动", symbol: "power", isOn: Binding(
+                get: { model.loginItemEnabled },
+                set: { _ in model.onToggleLogin() }
+            ))
+            settingRow("显示菜单栏图标", symbol: "menubar.rectangle", isOn: Binding(
+                get: { model.showMenuBarIcon },
+                set: { _ in model.onToggleMenuBarIcon() }
+            ))
+            settingRow("显示 Dock 图标", symbol: "dock.rectangle", isOn: Binding(
+                get: { model.showDockIcon },
+                set: { _ in model.onToggleDockIcon() }
+            ))
+
+            if !model.showMenuBarIcon && !model.showDockIcon {
+                Label("两者都已隐藏，用 ⌥⌘, 打开这个窗口", systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+            }
+        }
+    }
+
+    private func settingRow(_ title: String, symbol: String, isOn: Binding<Bool>) -> some View {
+        HStack {
+            Label(title, systemImage: symbol)
+                .font(.system(size: 13))
+            Spacer()
+            GlassSwitch(isOn: isOn)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(.quaternary.opacity(0.4))
+        )
+    }
+
+    private var actions: some View {
+        HStack(spacing: 10) {
+            Button {
+                model.onOpenConfig()
+            } label: {
+                Label("编辑配置", systemImage: "square.and.pencil")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                model.onReload()
+            } label: {
+                Label("重新加载", systemImage: "arrow.clockwise")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(.bordered)
+
+            Spacer()
+
+            Button("退出") { model.onQuit() }
+                .font(.system(size: 12))
+                .buttonStyle(.bordered)
+        }
+    }
+}
+
+/// 自绘开关：胶囊底 + 圆形滑块，跟着系统强调色走，未开启时是半透明灰
+struct GlassSwitch: View {
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Capsule(style: .continuous)
+            .fill(isOn ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.primary.opacity(0.18)))
+            .frame(width: 40, height: 23)
+            .overlay(alignment: isOn ? .trailing : .leading) {
+                Circle()
+                    .fill(.white)
+                    .padding(2.5)
+                    .shadow(color: .black.opacity(0.18), radius: 1.5, x: 0, y: 1)
+            }
+            .animation(.spring(response: 0.28, dampingFraction: 0.85), value: isOn)
+            .contentShape(Capsule())
+            .onTapGesture { isOn.toggle() }
+    }
+}
+
+// MARK: - 设置窗口
+
+final class SettingsWindowController: NSWindowController, NSWindowDelegate {
+    private let model: MacKitModel
+    var onClose: (() -> Void)?
+
+    init(model: MacKitModel) {
+        self.model = model
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 700),
+            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "mac-kit"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.isReleasedWhenClosed = false
+
+        super.init(window: window)
+
+        let host = NSHostingView(rootView: SettingsView(model: model))
+        host.translatesAutoresizingMaskIntoConstraints = false
+
+        let background = SettingsBackgroundView()
+        background.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView()
+        container.addSubview(background)
+        container.addSubview(host)
+        NSLayoutConstraint.activate([
+            background.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            background.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            background.topAnchor.constraint(equalTo: container.topAnchor),
+            background.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            host.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            host.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            host.topAnchor.constraint(equalTo: container.topAnchor),
+            host.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+
+        window.contentView = container
+        window.delegate = self
+        window.center()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) 未实现")
+    }
+
+    func present() {
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        onClose?()
+    }
+}
+
+/// macOS 26+ 用 Liquid Glass（NSGlassEffectView），更早的系统回退到毛玻璃
+final class SettingsBackgroundView: NSView {
+    private var glass: NSView?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+
+        if #available(macOS 26.0, *) {
+            let effect = NSGlassEffectView()
+            effect.style = .regular
+            effect.cornerRadius = 0
+            if #available(macOS 27.0, *) {
+                effect.effectIsInteractive = true
+            }
+            addSubview(effect)
+            effect.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                effect.leadingAnchor.constraint(equalTo: leadingAnchor),
+                effect.trailingAnchor.constraint(equalTo: trailingAnchor),
+                effect.topAnchor.constraint(equalTo: topAnchor),
+                effect.bottomAnchor.constraint(equalTo: bottomAnchor)
+            ])
+            glass = effect
+        } else {
+            let effect = NSVisualEffectView()
+            effect.material = .hudWindow
+            effect.blendingMode = .behindWindow
+            effect.state = .active
+            addSubview(effect)
+            effect.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                effect.leadingAnchor.constraint(equalTo: leadingAnchor),
+                effect.trailingAnchor.constraint(equalTo: trailingAnchor),
+                effect.topAnchor.constraint(equalTo: topAnchor),
+                effect.bottomAnchor.constraint(equalTo: bottomAnchor)
+            ])
+        }
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) 未实现")
+    }
+}
+
+// MARK: - 全局快捷键
+
+private let hotKeySignature: OSType = 0x4150_4C4E // 'APLN'
+private let settingsHotKeyID: UInt32 = 0xF000   // 保留 id：⌥⌘, 打开设置窗口
+
+private let hotKeyCallback: EventHandlerUPP = { _, event, userData in
+    guard let userData = userData else { return noErr }
+    var hotKeyID = EventHotKeyID()
+    let status = GetEventParameter(
+        event,
+        EventParamName(kEventParamDirectObject),
+        EventParamType(typeEventHotKeyID),
+        nil,
+        MemoryLayout<EventHotKeyID>.size,
+        nil,
+        &hotKeyID
+    )
+    guard status == noErr else { return noErr }
+    let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+    let id = hotKeyID.id
+    DispatchQueue.main.async {
+        delegate.fire(id: id)
+    }
+    return noErr
+}
+
+// MARK: - App Delegate
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var statusItem: NSStatusItem!
+    private var hotKeyRefs: [EventHotKeyRef] = []
+    private var bindingsByID: [UInt32: HotkeyBinding] = [:]
+    private var nextID: UInt32 = 1
+    private var eventHandler: EventHandlerRef?
+    private var lastMessage = "就绪"
+    private var appearanceObservation: NSKeyValueObservation?
+    private var settingsHotKeyRef: EventHotKeyRef?
+    private var settingsWindow: SettingsWindowController?
+    private let model = MacKitModel()
+
+    private let configURL: URL = {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = support.appendingPathComponent("mac-kit", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("config.json")
+    }()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        Log.write("启动 mac-kit \(Bundle.main.bundleIdentifier ?? "-")")
+        applyIcon(for: NSApp.effectiveAppearance)
+        observeAppearance()
+        setupStatusItem()
+        installCarbonHandler()
+        registerSettingsHotKey()
+        wireModel()
+        applyPresentation()
+        loadConfig()
+        rebuildMenu()
+
+        if CommandLine.arguments.contains("--settings") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.openSettings()
+            }
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        unregisterAll()
+        if let ref = settingsHotKeyRef { UnregisterEventHotKey(ref) }
+    }
+
+    // MARK: 图标
+
+    private func applyIcon(for appearance: NSAppearance) {
+        guard let image = AppIconAsset.forAppearance(appearance) else {
+            Log.write("图标资源缺失")
+            return
+        }
+        NSApp.applicationIconImage = image
+        model.icon = image
+    }
+
+    private func observeAppearance() {
+        appearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, change in
+            guard let appearance = change.newValue else { return }
+            DispatchQueue.main.async {
+                self?.applyIcon(for: appearance)
+            }
+        }
+
+        DistributedNotificationCenter.default.addObserver(
+            forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.applyIcon(for: NSApp.effectiveAppearance)
+        }
+    }
+
+    // MARK: 模型回调
+
+    private func wireModel() {
+        model.onReload = { [weak self] in self?.loadConfig(); self?.rebuildMenu() }
+        model.onToggleLogin = { [weak self] in self?.toggleLoginItem() }
+        model.onOpenConfig = { [weak self] in self?.openConfig() }
+        model.onQuit = { NSApp.terminate(nil) }
+        model.onCloseWindow = { [weak self] in self?.settingsWindow?.close() }
+        model.onToggleMenuBarIcon = { [weak self] in self?.toggleMenuBarIcon() }
+        model.onToggleDockIcon = { [weak self] in self?.toggleDockIcon() }
+    }
+
+    // MARK: 菜单栏图标
+
+    private func setupStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem.button {
+            let image = NSImage(systemSymbolName: "command", accessibilityDescription: "mac-kit")
+            image?.isTemplate = true
+            button.image = image
+            button.toolTip = "mac-kit — 快捷键启动 App"
+        }
+    }
+
+    // MARK: 菜单栏 / Dock 可见性
+
+    private func applyPresentation() {
+        statusItem.isVisible = Preferences.showMenuBarIcon
+        NSApp.setActivationPolicy(Preferences.showDockIcon ? .regular : .accessory)
+        model.showMenuBarIcon = Preferences.showMenuBarIcon
+        model.showDockIcon = Preferences.showDockIcon
+    }
+
+    private func toggleMenuBarIcon() {
+        Preferences.showMenuBarIcon.toggle()
+        applyPresentation()
+        lastMessage = Preferences.showMenuBarIcon ? "已显示菜单栏图标" : "已隐藏菜单栏图标"
+        Log.write(lastMessage)
+        syncModel()
+    }
+
+    private func toggleDockIcon() {
+        Preferences.showDockIcon.toggle()
+        applyPresentation()
+        lastMessage = Preferences.showDockIcon ? "已显示 Dock 图标" : "已隐藏 Dock 图标"
+        Log.write(lastMessage)
+        syncModel()
+    }
+
+    // MARK: Carbon 事件
+
+    private func installCarbonHandler() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        let status = InstallEventHandler(
+            GetApplicationEventTarget(),
+            hotKeyCallback,
+            1,
+            &spec,
+            Unmanaged.passUnretained(self).toOpaque(),
+            &eventHandler
+        )
+        if status != noErr {
+            Log.write("安装事件处理器失败: \(status)")
+        }
+    }
+
+    private func registerSettingsHotKey() {
+        var ref: EventHotKeyRef?
+        let hotKeyID = EventHotKeyID(signature: hotKeySignature, id: settingsHotKeyID)
+        let status = RegisterEventHotKey(
+            UInt32(KeyCodes.map[","]!),
+            UInt32(cmdKey | optionKey),
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &ref
+        )
+        if status == noErr, let ref = ref {
+            settingsHotKeyRef = ref
+            Log.write("注册设置热键 ⌥⌘,")
+        } else {
+            Log.write("注册设置热键失败 status=\(status)（可能被占用）")
+        }
+    }
+
+    private func unregisterAll() {
+        for ref in hotKeyRefs {
+            UnregisterEventHotKey(ref)
+        }
+        hotKeyRefs.removeAll()
+        bindingsByID.removeAll()
+        nextID = 1
+    }
+
+    // MARK: 配置
+
+    private func loadConfig() {
+        unregisterAll()
+
+        if !FileManager.default.fileExists(atPath: configURL.path) {
+            writeDefaultConfig()
+        }
+
+        guard let data = try? Data(contentsOf: configURL) else {
+            lastMessage = "读取配置失败"
+            Log.write("读取配置失败: \(configURL.path)")
+            syncModel()
+            return
+        }
+
+        do {
+            let config = try JSONDecoder().decode(Config.self, from: data)
+            var registered = 0
+            var rows: [MacKitModel.Row] = []
+            for binding in config.hotkeys {
+                let ok = register(binding)
+                if ok { registered += 1 }
+                let resolved = AppResolver.resolve(binding.target)?.path ?? "未找到"
+                rows.append(.init(keys: KeyCodes.label(binding), target: binding.target, resolved: resolved, ok: ok))
+                Log.write("\(ok ? "注册" : "注册失败") \(KeyCodes.label(binding)) → \(binding.target)")
+            }
+            lastMessage = "已注册 \(registered)/\(config.hotkeys.count) 个快捷键"
+            Log.write(lastMessage)
+            model.rows = rows
+        } catch {
+            lastMessage = "配置格式错误: \(error.localizedDescription)"
+            Log.write(lastMessage)
+        }
+        syncModel()
+    }
+
+    private func syncModel() {
+        model.status = lastMessage
+        model.loginItemEnabled = isLoginItemEnabled()
+    }
+
+    private func defaultConfig() -> Config {
+        // 默认：⌥⌘S Safari、⌥⌘F Finder、⌥⌘X 微信
+        let defaults: [(key: String, app: String)] = [
+            ("s", "Safari"),
+            ("f", "Finder"),
+            ("x", "WeChat")
+        ]
+        var bindings: [HotkeyBinding] = []
+        for entry in defaults where AppResolver.resolve(entry.app) != nil {
+            bindings.append(HotkeyBinding(key: entry.key, modifiers: ["option", "command"], target: entry.app))
+        }
+        return Config(hotkeys: bindings)
+    }
+
+    private func writeDefaultConfig() {
+        let config = defaultConfig()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(config) {
+            try? data.write(to: configURL)
+            Log.write("已生成默认配置: \(configURL.path)")
+        }
+    }
+
+    private func register(_ binding: HotkeyBinding) -> Bool {
+        guard let code = KeyCodes.map[binding.key.lowercased()] else { return false }
+        let modifiers = KeyCodes.carbonModifiers(binding.modifiers)
+        let id = nextID
+        let hotKeyID = EventHotKeyID(signature: hotKeySignature, id: id)
+        var ref: EventHotKeyRef?
+        let status = RegisterEventHotKey(UInt32(code), modifiers, hotKeyID, GetApplicationEventTarget(), 0, &ref)
+        guard status == noErr, let ref = ref else { return false }
+        hotKeyRefs.append(ref)
+        bindingsByID[id] = binding
+        nextID += 1
+        return true
+    }
+
+    // MARK: 触发
+
+    func fire(id: UInt32) {
+        if id == settingsHotKeyID {
+            openSettings()
+            return
+        }
+        guard let binding = bindingsByID[id] else { return }
+        launch(binding.target)
+    }
+
+    private func launch(_ target: String) {
+        guard let url = AppResolver.resolve(target) else {
+            lastMessage = "找不到应用: \(target)"
+            Log.write(lastMessage)
+            syncModel()
+            rebuildMenu()
+            return
+        }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { [weak self] _, error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    self?.lastMessage = "打开 \(target) 失败: \(error.localizedDescription)"
+                } else {
+                    self?.lastMessage = "已打开 \(target)"
+                }
+                Log.write(self?.lastMessage ?? "")
+                self?.syncModel()
+                self?.rebuildMenu()
+            }
+        }
+    }
+
+    // MARK: 菜单
+
+    private func rebuildMenu() {
+        let menu = NSMenu()
+
+        let header = NSMenuItem(title: "快捷键", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+
+        for (_, binding) in bindingsByID.sorted(by: { $0.key < $1.key }) {
+            let item = NSMenuItem(title: "\(KeyCodes.label(binding))  →  \(binding.target)", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+
+        if bindingsByID.isEmpty {
+            let item = NSMenuItem(title: "（没有可用的快捷键）", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+
+        menu.addItem(.separator())
+
+        let status = NSMenuItem(title: lastMessage, action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(status)
+
+        menu.addItem(.separator())
+        menu.addItem(item("偏好设置…  ⌥⌘,", #selector(openSettings), "gearshape", key: ","))
+        menu.addItem(item("重新加载配置", #selector(reloadConfig), "arrow.clockwise", key: "r"))
+        menu.addItem(item("打开配置文件…", #selector(openConfig), "doc.text", key: ""))
+        menu.addItem(item("打开日志", #selector(openLog), "text.alignleft", key: ""))
+
+        let loginItem = item("开机自启", #selector(toggleLoginItemFromMenu), "", key: "")
+        loginItem.state = isLoginItemEnabled() ? .on : .off
+        menu.addItem(loginItem)
+
+        menu.addItem(.separator())
+        menu.addItem(item("退出 mac-kit", #selector(quit), "", key: "q"))
+
+        for entry in menu.items where entry.action != nil {
+            entry.target = self
+        }
+
+        statusItem.menu = menu
+    }
+
+    private func item(_ title: String, _ action: Selector, _ symbol: String, key: String) -> NSMenuItem {
+        let entry = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        if !symbol.isEmpty, let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
+            entry.image = image
+        }
+        return entry
+    }
+
+    @objc private func openSettings() {
+        if settingsWindow == nil {
+            let controller = SettingsWindowController(model: model)
+            settingsWindow = controller
+        }
+        syncModel()
+        settingsWindow?.present()
+    }
+
+    @objc private func reloadConfig() {
+        loadConfig()
+        rebuildMenu()
+    }
+
+    @objc private func openConfig() {
+        if !FileManager.default.fileExists(atPath: configURL.path) {
+            writeDefaultConfig()
+        }
+        NSWorkspace.shared.open(configURL)
+    }
+
+    @objc private func openLog() {
+        NSWorkspace.shared.open(Log.url)
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
+    }
+
+    // MARK: 开机自启
+
+    private func isLoginItemEnabled() -> Bool {
+        if #available(macOS 13.0, *) {
+            return SMAppService.mainApp.status == .enabled
+        }
+        return false
+    }
+
+    private func toggleLoginItem() {
+        if #available(macOS 13.0, *) {
+            do {
+                if SMAppService.mainApp.status == .enabled {
+                    try SMAppService.mainApp.unregister()
+                    lastMessage = "已取消开机自启"
+                } else {
+                    try SMAppService.mainApp.register()
+                    lastMessage = "已开启开机自启"
+                }
+            } catch {
+                lastMessage = "设置开机自启失败: \(error.localizedDescription)"
+            }
+            Log.write(lastMessage)
+            syncModel()
+            rebuildMenu()
+        }
+    }
+
+    @objc private func toggleLoginItemFromMenu() {
+        toggleLoginItem()
+    }
+}
+
+// MARK: - 自检模式
+
+func runCheck() -> Never {
+    let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    let url = support.appendingPathComponent("mac-kit", isDirectory: true).appendingPathComponent("config.json")
+    if !FileManager.default.fileExists(atPath: url.path) {
+        print("配置文件不存在: \(url.path)")
+        exit(1)
+    }
+    guard let data = try? Data(contentsOf: url), let config = try? JSONDecoder().decode(Config.self, from: data) else {
+        print("配置文件解析失败")
+        exit(1)
+    }
+    _ = NSApplication.shared
+    var ok = 0
+    for binding in config.hotkeys {
+        guard let code = KeyCodes.map[binding.key.lowercased()] else {
+            print("✗ \(binding.key) 不是支持的键名")
+            continue
+        }
+        var ref: EventHotKeyRef?
+        let id = EventHotKeyID(signature: hotKeySignature, id: UInt32(ok + 1))
+        let status = RegisterEventHotKey(UInt32(code), KeyCodes.carbonModifiers(binding.modifiers), id, GetApplicationEventTarget(), 0, &ref)
+        let resolved = AppResolver.resolve(binding.target)?.path ?? "未找到"
+        if status == noErr, let ref = ref {
+            UnregisterEventHotKey(ref)
+            ok += 1
+            print("✓ \(KeyCodes.label(binding)) → \(binding.target)  (\(resolved))")
+        } else {
+            print("✗ \(KeyCodes.label(binding)) → \(binding.target)  注册失败 status=\(status)")
+        }
+    }
+    let appearance = NSApp.effectiveAppearance
+    let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    let icon = AppIconAsset.forAppearance(appearance)
+    print("当前外观: \(isDark ? "dark" : "light")，图标: \(icon == nil ? "缺失" : "已加载")（\(isDark ? "AppIcon-Dark.icns" : "AppIcon.icns")）")
+    print("\(ok)/\(config.hotkeys.count) 个快捷键可用")
+    exit(ok == config.hotkeys.count ? 0 : 2)
+}
+
+// MARK: - 界面快照（--snapshot 输出 PNG，便于离线检查排版）
+
+@MainActor
+func renderSnapshot(to path: String) -> Never {
+    _ = NSApplication.shared
+    let model = MacKitModel()
+    let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("mac-kit", isDirectory: true)
+        .appendingPathComponent("config.json")
+
+    if let data = try? Data(contentsOf: url), let config = try? JSONDecoder().decode(Config.self, from: data) {
+        model.rows = config.hotkeys.map { binding in
+            let resolved = AppResolver.resolve(binding.target)
+            return MacKitModel.Row(
+                keys: KeyCodes.label(binding),
+                target: binding.target,
+                resolved: resolved?.path ?? "未找到",
+                ok: resolved != nil
+            )
+        }
+        model.status = "已注册 \(config.hotkeys.count)/\(config.hotkeys.count) 个快捷键"
+    }
+    model.icon = AppIconAsset.light
+
+    let view = SettingsView(model: model)
+        .background(
+            LinearGradient(
+                colors: [Color(red: 0.36, green: 0.40, blue: 0.50), Color(red: 0.09, green: 0.10, blue: 0.14)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+
+    let renderer = ImageRenderer(content: view)
+    renderer.scale = 2
+    if let image = renderer.nsImage,
+       let tiff = image.tiffRepresentation,
+       let rep = NSBitmapImageRep(data: tiff),
+       let png = rep.representation(using: .png, properties: [:]) {
+        try? png.write(to: URL(fileURLWithPath: path))
+        print("saved \(path)")
+    } else {
+        print("render failed")
+    }
+    exit(0)
+}
+
+// MARK: - 入口
+
+let app = NSApplication.shared
+if CommandLine.arguments.contains("--check") {
+    runCheck()
+}
+
+if let index = CommandLine.arguments.firstIndex(of: "--snapshot"), CommandLine.arguments.count > index + 1 {
+    let path = CommandLine.arguments[index + 1]
+    Task { @MainActor in
+        renderSnapshot(to: path)
+    }
+    RunLoop.main.run()
+}
+
+if let index = CommandLine.arguments.firstIndex(of: "--open"), CommandLine.arguments.count > index + 1 {
+    let target = CommandLine.arguments[index + 1]
+    guard let url = AppResolver.resolve(target) else {
+        print("✗ 找不到应用: \(target)")
+        exit(1)
+    }
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.activates = true
+    NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
+        if let error = error {
+            print("✗ 打开失败: \(error.localizedDescription)")
+            exit(1)
+        }
+        print("✓ 已打开 \(target)  (\(url.path))")
+        exit(0)
+    }
+    RunLoop.main.run()
+}
+
+let delegate = AppDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.accessory)
+app.run()

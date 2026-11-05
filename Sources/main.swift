@@ -567,22 +567,25 @@ final class MacKitModel: ObservableObject {
 // MARK: - SwiftUI 界面
 
 enum SettingsPage: String, CaseIterable, Identifiable {
-    case launcher
     case tools
+    case launcher
+    case settings
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .launcher: return "快捷启动"
         case .tools: return "常用工具"
+        case .launcher: return "快捷启动"
+        case .settings: return "基础设置"
         }
     }
 
     var symbol: String {
         switch self {
-        case .launcher: return "command"
         case .tools: return "wand.and.stars"
+        case .launcher: return "command"
+        case .settings: return "gearshape"
         }
     }
 }
@@ -699,10 +702,12 @@ struct SettingsView: View {
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
 
             switch page {
-            case .launcher:
-                launcherPage
             case .tools:
                 toolsPage
+            case .launcher:
+                launcherPage
+            case .settings:
+                appSettingsPage
             }
 
             Spacer(minLength: 0)
@@ -720,8 +725,12 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 14) {
             sectionLabel("快捷键")
             shortcutList
+        }
+    }
 
-            sectionLabel("设置")
+    private var appSettingsPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            sectionLabel("应用")
             settingsRows
         }
     }
@@ -895,11 +904,19 @@ struct SettingsView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(page == .tools ? toolsFooterText : model.status)
+            Text(footerText)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
 
             actions
+        }
+    }
+
+    private var footerText: String {
+        switch page {
+        case .tools: return toolsFooterText
+        case .settings: return "修改即时生效"
+        case .launcher: return model.status
         }
     }
 

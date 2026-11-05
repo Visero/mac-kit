@@ -164,6 +164,17 @@ enum Preferences {
         set { UserDefaults.standard.set(newValue, forKey: dockKey) }
     }
 
+    private static let selfHotkeyKey = "selfHotkeyEnabled"
+
+    /// ⌘⌥K 打开设置窗口，默认开启
+    static var selfHotkeyEnabled: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: selfHotkeyKey) == nil { return true }
+            return UserDefaults.standard.bool(forKey: selfHotkeyKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: selfHotkeyKey) }
+    }
+
     private static let orderKey = "sidebarOrder"
 
     /// 侧栏顺序；读不到或数量不对时回落到默认顺序
@@ -246,7 +257,7 @@ enum RecordCleaner {
         return urls
     }
 
-    private static var safariIsRunning: Bool {
+    static var safariIsRunning: Bool {
         NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == "com.apple.Safari" }
     }
 
@@ -347,6 +358,27 @@ enum RecordCleaner {
             return ("Safari 浏览记录：\(range.title)没有记录", false)
         }
         return ("Safari 浏览记录：已清空「\(range.title)」的 \(deleted) 条", false)
+    }
+
+    /// 优雅退出 Safari，等它真的退出（最多约 5 秒）后回调
+    static func quitSafari(attempt: Int = 0, completion: @escaping () -> Void) {
+        guard safariIsRunning else {
+            completion()
+            return
+        }
+        if attempt > 20 {
+            completion()
+            return
+        }
+        if attempt == 0 {
+            NSWorkspace.shared.runningApplications
+                .first { $0.bundleIdentifier == "com.apple.Safari" }?
+                .terminate()
+            Log.write("请求退出 Safari")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            quitSafari(attempt: attempt + 1, completion: completion)
+        }
     }
 
     /// 删除 visit_time >= cutoff 的记录，并清掉因此变空的 history_items
@@ -454,6 +486,7 @@ final class MacKitModel: ObservableObject {
         didSet { Preferences.sidebarOrder = pageOrder }
     }
     @Published var draggingPage: SettingsPage?
+    @Published var selfHotkeyEnabled: Bool = Preferences.selfHotkeyEnabled
     private var dragStartIndex = 0
     private let sidebarRowHeight: CGFloat = 34
 
@@ -482,6 +515,29 @@ final class MacKitModel: ObservableObject {
     @Published var toolsStatus: String = ""
     @Published var toolsNeedsFullDiskAccess: Bool = false
     @Published var toolsLastRun: Date?
+    @Published var showQuitSafariConfirm: Bool = false
+
+    /// 点「清空」后的入口：Safari 在跑就先问要不要退
+    func requestClearRecords() {
+        guard clearSafariHistory || clearRecentFiles else {
+            toolsStatus = "先勾选要清理的选项"
+            return
+        }
+        if clearSafariHistory && RecordCleaner.safariIsRunning {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.showQuitSafariConfirm = true
+            }
+        } else {
+            clearSelectedRecords()
+        }
+    }
+
+    func quitSafariAndClear() {
+        toolsStatus = "正在退出 Safari…"
+        RecordCleaner.quitSafari { [weak self] in
+            self?.clearSelectedRecords()
+        }
+    }
 
     func clearSelectedRecords() {
         guard clearSafariHistory || clearRecentFiles else {
@@ -505,6 +561,7 @@ final class MacKitModel: ObservableObject {
     var onCloseWindow: () -> Void = {}
     var onToggleMenuBarIcon: () -> Void = {}
     var onToggleDockIcon: () -> Void = {}
+    var onToggleSelfHotkey: () -> Void = {}
 }
 
 // MARK: - SwiftUI 界面
@@ -546,11 +603,12 @@ struct SettingsView: View {
         }
         .frame(width: 720, height: 620)
         .alert("清空这些记录？", isPresented: $model.showClearConfirm) {
-            Button("清空", role: .destructive) { model.clearSelectedRecords() }
+            Button("清空", role: .destructive) { model.requestClearRecords() }
             Button("取消", role: .cancel) {}
         } message: {
             Text("Safari 浏览记录和最近使用文件记录，清空后无法恢复。")
         }
+
     }
 
     // MARK: 侧栏
@@ -738,6 +796,12 @@ struct SettingsView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
         }
+        .alert("Safari 正在运行", isPresented: $model.showQuitSafariConfirm) {
+            Button("退出 Safari 并清空", role: .destructive) { model.quitSafariAndClear() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("清空浏览记录前需要先退出 Safari，否则运行中的记录会被写回。")
+        }
     }
 
     private var historyRangeRow: some View {
@@ -910,6 +974,10 @@ struct SettingsView: View {
             settingRow("显示 Dock 图标", symbol: "dock.rectangle", isOn: Binding(
                 get: { model.showDockIcon },
                 set: { _ in model.onToggleDockIcon() }
+            ))
+            settingRow("⌘⌥K 打开设置窗口", symbol: "keyboard", isOn: Binding(
+                get: { model.selfHotkeyEnabled },
+                set: { _ in model.onToggleSelfHotkey() }
             ))
 
             if !model.showMenuBarIcon && !model.showDockIcon {
@@ -1098,6 +1166,7 @@ final class SettingsBackgroundView: NSView {
 
 private let hotKeySignature: OSType = 0x4150_4C4E // 'APLN'
 private let settingsHotKeyID: UInt32 = 0xF000   // 保留 id：⌥⌘, 打开设置窗口
+private let selfHotKeyID: UInt32 = 0xF001       // 保留 id：⌘⌥K 打开设置窗口
 
 private let hotKeyCallback: EventHandlerUPP = { _, event, userData in
     guard let userData = userData else { return noErr }
@@ -1185,6 +1254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastMessage = "就绪"
     private var appearanceObservation: NSKeyValueObservation?
     private var settingsHotKeyRef: EventHotKeyRef?
+    private var selfHotKeyRef: EventHotKeyRef?
     private var settingsWindow: SettingsWindowController?
     private let model = MacKitModel()
 
@@ -1211,6 +1281,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusItem()
         installCarbonHandler()
         registerSettingsHotKey()
+        if Preferences.selfHotkeyEnabled { _ = registerSelfHotKey() }
         wireModel()
         applyPresentation()
         loadConfig()
@@ -1228,6 +1299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         unregisterAll()
         if let ref = settingsHotKeyRef { UnregisterEventHotKey(ref) }
+        unregisterSelfHotKey()
     }
 
     // MARK: 图标
@@ -1268,6 +1340,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onCloseWindow = { [weak self] in self?.settingsWindow?.close() }
         model.onToggleMenuBarIcon = { [weak self] in self?.toggleMenuBarIcon() }
         model.onToggleDockIcon = { [weak self] in self?.toggleDockIcon() }
+        model.onToggleSelfHotkey = { [weak self] in self?.toggleSelfHotkey() }
     }
 
     // MARK: 菜单栏图标
@@ -1392,6 +1465,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func syncModel() {
         model.status = lastMessage
         model.loginItemEnabled = isLoginItemEnabled()
+        model.selfHotkeyEnabled = Preferences.selfHotkeyEnabled
     }
 
     private func defaultConfig() -> Config {
@@ -1432,10 +1506,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    @discardableResult
+    private func registerSelfHotKey() -> Bool {
+        unregisterSelfHotKey()
+        var ref: EventHotKeyRef?
+        let hotKeyID = EventHotKeyID(signature: hotKeySignature, id: selfHotKeyID)
+        let status = RegisterEventHotKey(
+            UInt32(KeyCodes.map["k"]!),
+            UInt32(cmdKey | optionKey),
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &ref
+        )
+        guard status == noErr, let ref = ref else {
+            Log.write("注册 ⌘⌥K 失败 status=\(status)（可能被占用）")
+            return false
+        }
+        selfHotKeyRef = ref
+        Log.write("注册 ⌘⌥K 打开设置窗口")
+        return true
+    }
+
+    private func unregisterSelfHotKey() {
+        if let ref = selfHotKeyRef {
+            UnregisterEventHotKey(ref)
+            selfHotKeyRef = nil
+        }
+    }
+
+    private func toggleSelfHotkey() {
+        if Preferences.selfHotkeyEnabled {
+            unregisterSelfHotKey()
+            Preferences.selfHotkeyEnabled = false
+            lastMessage = "已关闭 ⌘⌥K"
+        } else {
+            Preferences.selfHotkeyEnabled = true
+            if registerSelfHotKey() {
+                lastMessage = "已开启 ⌘⌥K"
+            } else {
+                Preferences.selfHotkeyEnabled = false
+                lastMessage = "⌘⌥K 注册失败，可能被其他 App 占用"
+            }
+        }
+        Log.write(lastMessage)
+        syncModel()
+        rebuildMenu()
+    }
+
     // MARK: 触发
 
     func fire(id: UInt32) {
-        if id == settingsHotKeyID {
+        if id == settingsHotKeyID || id == selfHotKeyID {
             openSettings()
             return
         }

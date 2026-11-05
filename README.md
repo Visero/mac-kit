@@ -8,6 +8,7 @@
 - 设置窗口左侧是侧栏：**快捷启动**（全局快捷键）和 **常用工具**（一键清空记录），两项可拖动排序
 - 常用工具：清空 Safari 浏览记录（按今天 / 今天和昨天 / 一周 / 一个月 / 全部）、最近使用文件记录，可分别勾选
 - 开机自启时只驻留菜单栏；**手动打开（Finder 双击 / Dock / `open`）会直接弹出设置窗口**
+- 默认注册 **⌘⌥K** 直接打开设置窗口，可在设置里关掉
 - 图标与设置窗口都按 macOS 26/27 的 Liquid Glass 风格重新设计
 - 配置是一个 JSON 文件，改完点「重新加载配置」即生效
 
@@ -41,7 +42,7 @@
 **快捷启动**（默认页）：
 
 - 快捷键列表：每条显示按键、目标 App、解析到的真实路径和注册状态（✓ / ⚠）
-- 开关：登录时自动启动（`SMAppService`）、显示菜单栏图标、显示 Dock 图标
+- 开关：登录时自动启动、显示菜单栏图标、显示 Dock 图标、⌘⌥K 打开设置窗口
 - 按钮：编辑配置 / 重新加载 / 退出
 
 **常用工具**：
@@ -51,7 +52,7 @@
 - 按范围清历史是打开 `History.db` 用 sqlite3 删 `history_visits` 里 `visit_time` 落在范围内的行，再把因此变空的 `history_items` 清掉；选「全部」则直接删库文件
 - 一键清空记录：二次确认后执行，结果显示在页面上
 - 两个目录都受 TCC 保护，需要在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里勾选 mac-kit；页面里有直接跳转该设置的按钮
-- 清 Safari 历史前要先退出 Safari（运行中的记录会被写回）
+- 清 Safari 历史时如果 Safari 正在运行，会弹框问「退出 Safari 并清空」还是取消；确认后先让 Safari 优雅退出再清
 
 ### 隐藏菜单栏图标 / 隐藏 Dock 图标
 
@@ -186,6 +187,7 @@ rm -f ~/Library/Logs/mac-kit.log
 - 设置窗口是 `NSHostingView(SwiftUI)` 套在 `NSGlassEffectView` 里，窗口 `titlebarAppearsTransparent` + `fullSizeContentView`
 - 侧栏选中项、清空确认弹窗都存在 `MacKitModel`（`@Published`）里，没有用 `@State`——纯 Command Line Tools 环境没有 SwiftUI 宏插件，`@State` 编译不过
 - 菜单栏图标与 Dock 图标分别由 `NSStatusItem.isVisible` 和 `NSApp.setActivationPolicy(_:)` 控制，状态存 `UserDefaults`
+- 两个保留热键用 Carbon 单独注册：`⌥⌘,`（兜底开设置）和 `⌘⌥K`（开设置，可在设置里关）；`⌘⌥K` 被别的 App 占用时开关会回退并提示
 - 开机自启用自己写的 LaunchAgent（`~/Library/LaunchAgents/com.kaix.mac-kit.plist`，`RunAtLoad` + `--login` 参数），不用 `SMAppService`：登录时靠这个参数判断「不是用户手动打开的」，就不弹设置窗口；再次启动已在运行的实例走 `applicationShouldHandleReopen`
 - 记录清理只看两处：`~/Library/Safari/History.db*` 和 `~/Library/Application Support/com.apple.sharedfilelist/` 下的 `RecentDocuments` / `RecentApplications` / 各 App 的 `.sfl3`；TCC 拦截时目录本身读不到，据此判定需要完全磁盘访问权限
 - 保留热键 `⌥⌘,`（Carbon 注册，id `0xF000`）用于兜底打开设置窗口

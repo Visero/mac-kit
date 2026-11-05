@@ -175,6 +175,23 @@ enum Preferences {
         set { UserDefaults.standard.set(newValue, forKey: selfHotkeyKey) }
     }
 
+    private static let autoUpdateKey = "autoUpdateCheck"
+    private static let lastUpdateKey = "lastUpdateCheck"
+
+    /// 自动检查更新，默认开启
+    static var autoUpdateCheck: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: autoUpdateKey) == nil { return true }
+            return UserDefaults.standard.bool(forKey: autoUpdateKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: autoUpdateKey) }
+    }
+
+    static var lastUpdateCheck: Date? {
+        get { UserDefaults.standard.object(forKey: lastUpdateKey) as? Date }
+        set { UserDefaults.standard.set(newValue, forKey: lastUpdateKey) }
+    }
+
     private static let orderKey = "sidebarOrder"
 
     /// 侧栏顺序；读不到或数量不对时回落到默认顺序
@@ -487,6 +504,11 @@ final class MacKitModel: ObservableObject {
     }
     @Published var draggingPage: SettingsPage?
     @Published var selfHotkeyEnabled: Bool = Preferences.selfHotkeyEnabled
+
+    // 更新检查
+    @Published var autoUpdateCheck: Bool = Preferences.autoUpdateCheck
+    @Published var updateStatus: String = ""
+    @Published var availableUpdate: UpdateChecker.Release?
     private var dragStartIndex = 0
     private let sidebarRowHeight: CGFloat = 34
 
@@ -562,6 +584,9 @@ final class MacKitModel: ObservableObject {
     var onToggleMenuBarIcon: () -> Void = {}
     var onToggleDockIcon: () -> Void = {}
     var onToggleSelfHotkey: () -> Void = {}
+    var onCheckUpdate: () -> Void = {}
+    var onToggleAutoUpdate: () -> Void = {}
+    var onOpenUpdate: () -> Void = {}
 }
 
 // MARK: - SwiftUI 界面
@@ -732,6 +757,56 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 14) {
             sectionLabel("应用")
             settingsRows
+
+            sectionLabel("关于")
+            updateRows
+        }
+    }
+
+    private var updateRows: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 10) {
+                Label("版本 \(UpdateChecker.currentVersion)（\(UpdateChecker.currentBuild)）", systemImage: "info.circle")
+                    .font(.system(size: 13))
+                Spacer()
+                Text(model.updateStatus)
+                    .font(.system(size: 11))
+                    .foregroundStyle(model.availableUpdate == nil ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.accentColor))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(.quaternary.opacity(0.4))
+            )
+
+            HStack(spacing: 10) {
+                Button {
+                    model.onCheckUpdate()
+                } label: {
+                    Label("检查更新", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.bordered)
+
+                if let update = model.availableUpdate {
+                    Button {
+                        model.onOpenUpdate()
+                    } label: {
+                        Label("下载 \(update.version)", systemImage: "arrow.down.circle")
+                            .font(.system(size: 12))
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+
+                Spacer()
+            }
+
+            settingRow("自动检查更新", symbol: "clock.arrow.circlepath", isOn: Binding(
+                get: { model.autoUpdateCheck },
+                set: { _ in model.onToggleAutoUpdate() }
+            ))
         }
     }
 
@@ -1206,6 +1281,103 @@ private let hotKeyCallback: EventHandlerUPP = { _, event, userData in
     return noErr
 }
 
+// MARK: - 检查更新（GitHub Release）
+
+enum UpdateChecker {
+    struct Release {
+        let version: String
+        let pageURL: URL
+        let notes: String?
+    }
+
+    struct CheckError: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
+
+    private static let repo = "Visero/mac-kit"
+
+    static var currentVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+    }
+
+    static var currentBuild: String {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
+    }
+
+    private static func request(_ path: String, completion: @escaping (Data?, Int, Error?) -> Void) {
+        guard let url = URL(string: "https://api.github.com/repos/\(repo)\(path)") else {
+            completion(nil, 0, CheckError(message: "地址无效"))
+            return
+        }
+        var req = URLRequest(url: url, timeoutInterval: 12)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("MacKit/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            completion(data, (response as? HTTPURLResponse)?.statusCode ?? 0, error)
+        }.resume()
+    }
+
+    /// 优先读最新 Release；没有 Release 时退回 tags。`nil` 表示仓库还没有任何版本。
+    static func check(completion: @escaping (Result<Release?, Error>) -> Void) {
+        request("/releases/latest") { data, code, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+            if code == 200, let data = data, let release = parseRelease(data) {
+                completion(.success(release))
+                return
+            }
+            guard code == 404 else {
+                completion(.failure(CheckError(message: "GitHub 返回 \(code)")))
+                return
+            }
+            request("/tags") { data, code, error in
+                if let error = error {
+                    completion(.failure(error))
+                    return
+                }
+                guard code == 200, let data = data,
+                      let tags = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+                      let name = tags.first?["name"] as? String else {
+                    completion(.success(nil))
+                    return
+                }
+                let page = URL(string: "https://github.com/\(repo)/releases")!
+                completion(.success(Release(version: name, pageURL: page, notes: nil)))
+            }
+        }
+    }
+
+    static func parseRelease(_ data: Data) -> Release? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tag = json["tag_name"] as? String else { return nil }
+        let page = (json["html_url"] as? String).flatMap(URL.init(string:))
+            ?? URL(string: "https://github.com/\(repo)/releases")!
+        return Release(version: tag, pageURL: page, notes: json["body"] as? String)
+    }
+
+    private static func components(_ version: String) -> [Int] {
+        version
+            .trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
+            .split(separator: ".")
+            .map { part in Int(part.prefix(while: { $0.isNumber })) ?? 0 }
+    }
+
+    /// 远端版本是否比本地新（逐段比较数字）
+    static func isNewer(_ remote: String, than local: String) -> Bool {
+        let remoteParts = components(remote)
+        let localParts = components(local)
+        for index in 0..<max(remoteParts.count, localParts.count) {
+            let remotePart = index < remoteParts.count ? remoteParts[index] : 0
+            let localPart = index < localParts.count ? localParts[index] : 0
+            if remotePart != localPart { return remotePart > localPart }
+        }
+        return false
+    }
+}
+
 // MARK: - 开机自启（LaunchAgent）
 
 enum LoginAgent {
@@ -1270,6 +1442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var eventHandler: EventHandlerRef?
     private var lastMessage = "就绪"
     private var appearanceObservation: NSKeyValueObservation?
+    private var updateTimer: Timer?
     private var settingsHotKeyRef: EventHotKeyRef?
     private var selfHotKeyRef: EventHotKeyRef?
     private var settingsWindow: SettingsWindowController?
@@ -1303,6 +1476,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyPresentation()
         loadConfig()
         rebuildMenu()
+        scheduleUpdateChecks()
 
         let forceSettings = CommandLine.arguments.contains("--settings")
         if forceSettings || !launchedAtLogin {
@@ -1358,6 +1532,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onToggleMenuBarIcon = { [weak self] in self?.toggleMenuBarIcon() }
         model.onToggleDockIcon = { [weak self] in self?.toggleDockIcon() }
         model.onToggleSelfHotkey = { [weak self] in self?.toggleSelfHotkey() }
+        model.onCheckUpdate = { [weak self] in self?.checkForUpdates(manual: true) }
+        model.onToggleAutoUpdate = { [weak self] in self?.toggleAutoUpdate() }
+        model.onOpenUpdate = { [weak self] in self?.openUpdatePage() }
+    }
+
+    // MARK: 检查更新
+
+    private func scheduleUpdateChecks() {
+        model.autoUpdateCheck = Preferences.autoUpdateCheck
+        model.updateStatus = "尚未检查"
+
+        if Preferences.autoUpdateCheck {
+            let last = Preferences.lastUpdateCheck ?? .distantPast
+            if Date().timeIntervalSince(last) > 6 * 3600 {
+                // 启动后稍等再查，不抢启动时的资源
+                DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+                    self?.checkForUpdates(manual: false)
+                }
+            }
+        }
+
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
+            guard Preferences.autoUpdateCheck else { return }
+            self?.checkForUpdates(manual: false)
+        }
+    }
+
+    func checkForUpdates(manual: Bool) {
+        if manual { model.updateStatus = "正在检查…" }
+        Log.write("检查更新（\(manual ? "手动" : "自动")）")
+        UpdateChecker.check { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                Preferences.lastUpdateCheck = Date()
+                switch result {
+                case .success(let release):
+                    if let release = release, UpdateChecker.isNewer(release.version, than: UpdateChecker.currentVersion) {
+                        self.model.availableUpdate = release
+                        self.model.updateStatus = "发现新版本 \(release.version)"
+                        self.lastMessage = "有新版本 \(release.version)"
+                        Log.write("发现新版本 \(release.version)")
+                    } else {
+                        self.model.availableUpdate = nil
+                        self.model.updateStatus = release == nil ? "仓库还没有发布版本" : "已是最新"
+                        Log.write("已是最新（远端 \(release?.version ?? "无")）")
+                    }
+                case .failure(let error):
+                    self.model.updateStatus = "检查失败，稍后重试"
+                    Log.write("检查更新失败：\(error.localizedDescription)")
+                }
+                self.rebuildMenu()
+            }
+        }
+    }
+
+    private func toggleAutoUpdate() {
+        Preferences.autoUpdateCheck.toggle()
+        model.autoUpdateCheck = Preferences.autoUpdateCheck
+        lastMessage = Preferences.autoUpdateCheck ? "已开启自动检查更新" : "已关闭自动检查更新"
+        Log.write(lastMessage)
+        syncModel()
+        rebuildMenu()
+    }
+
+    private func openUpdatePage() {
+        guard let release = model.availableUpdate else { return }
+        NSWorkspace.shared.open(release.pageURL)
+    }
+
+    @objc private func checkUpdatesFromMenu() {
+        checkForUpdates(manual: true)
+    }
+
+    @objc private func openUpdateFromMenu() {
+        openUpdatePage()
     }
 
     // MARK: 菜单栏图标
@@ -1639,6 +1888,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(item("重新加载配置", #selector(reloadConfig), "arrow.clockwise", key: "r"))
         menu.addItem(item("打开配置文件…", #selector(openConfig), "doc.text", key: ""))
         menu.addItem(item("打开日志", #selector(openLog), "text.alignleft", key: ""))
+        menu.addItem(item("检查更新…", #selector(checkUpdatesFromMenu), "arrow.triangle.2.circlepath", key: ""))
+        if let update = model.availableUpdate {
+            menu.addItem(item("有新版本 \(update.version)…", #selector(openUpdateFromMenu), "arrow.down.circle", key: ""))
+        }
 
         let loginItem = item("开机自启", #selector(toggleLoginItemFromMenu), "", key: "")
         loginItem.state = isLoginItemEnabled() ? .on : .off
@@ -1674,6 +1927,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func reloadConfig() {
         loadConfig()
         rebuildMenu()
+        scheduleUpdateChecks()
     }
 
     @objc private func openConfig() {
@@ -1780,6 +2034,7 @@ func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
         model.status = "已注册 \(config.hotkeys.count)/\(config.hotkeys.count) 个快捷键"
     }
     model.icon = AppIconAsset.light
+    model.updateStatus = "已是最新"
     if page == .tools {
         if CommandLine.arguments.contains("--fda") {
             model.toolsStatus = "Safari 浏览记录：没有访问权限\n最近使用文件记录：没有访问权限"
@@ -1833,6 +2088,56 @@ func runLoginToggle(_ action: String) -> Never {
     }
     print("自启状态: \(LoginAgent.isEnabled ? "开启" : "关闭")")
     exit(0)
+}
+
+// MARK: - 版本与更新自检（--version / --update-check）
+
+func runVersionCheck() -> Never {
+    print("MacKit \(UpdateChecker.currentVersion)（\(UpdateChecker.currentBuild)）")
+    exit(0)
+}
+
+func runUpdateCheck() -> Never {
+    print("当前版本 \(UpdateChecker.currentVersion)（build \(UpdateChecker.currentBuild)）")
+    print("版本比较自检: v1.2.0>1.0 → \(UpdateChecker.isNewer("v1.2.0", than: "1.0"))"
+          + "，1.0>v1.2.0 → \(UpdateChecker.isNewer("1.0", than: "v1.2.0"))"
+          + "，v1.0.1>v1.0 → \(UpdateChecker.isNewer("v1.0.1", than: "v1.0"))")
+    let semaphore = DispatchSemaphore(value: 0)
+    var exitCode: Int32 = 0
+    UpdateChecker.check { result in
+        switch result {
+        case .success(let release):
+            if let release = release {
+                let newer = UpdateChecker.isNewer(release.version, than: UpdateChecker.currentVersion)
+                print("远端最新: \(release.version) → \(newer ? "有更新" : "已是最新")")
+                print("页面: \(release.pageURL.absoluteString)")
+            } else {
+                print("远端还没有发布版本（Release / Tag 都为空）")
+            }
+        case .failure(let error):
+            print("检查失败：\(error.localizedDescription)")
+            exitCode = 1
+        }
+        semaphore.signal()
+    }
+    _ = semaphore.wait(timeout: .now() + 25)
+    exit(exitCode)
+}
+
+/// 用一段真实格式的 GitHub Release JSON 验证解析链路（--update-fixture）
+func runUpdateFixtureTest() -> Never {
+    let json = """
+    {"tag_name":"v1.4.2","html_url":"https://github.com/Visero/mac-kit/releases/tag/v1.4.2","body":"- 修复若干问题"}
+    """
+    guard let release = UpdateChecker.parseRelease(Data(json.utf8)) else {
+        print("解析失败")
+        exit(1)
+    }
+    let newer = UpdateChecker.isNewer(release.version, than: UpdateChecker.currentVersion)
+    print("解析到 \(release.version)，比当前 \(UpdateChecker.currentVersion) 新: \(newer)")
+    print("页面: \(release.pageURL.absoluteString)")
+    print("更新说明: \(release.notes ?? "无")")
+    exit(newer ? 0 : 1)
 }
 
 // MARK: - 时间范围自检（--range-test，用临时库验证，不动真实历史）
@@ -1906,6 +2211,10 @@ if CommandLine.arguments.contains("--tools-check") {
 if CommandLine.arguments.contains("--range-test") {
     runRangeTest()
 }
+
+if CommandLine.arguments.contains("--version") { runVersionCheck() }
+if CommandLine.arguments.contains("--update-check") { runUpdateCheck() }
+if CommandLine.arguments.contains("--update-fixture") { runUpdateFixtureTest() }
 
 for flag in ["--login-on", "--login-off", "--login-status"] where CommandLine.arguments.contains(flag) {
     runLoginToggle(flag)

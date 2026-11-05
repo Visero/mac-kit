@@ -9,6 +9,7 @@
 - 常用工具：清空 Safari 浏览记录（按今天 / 今天和昨天 / 一周 / 一个月 / 全部）、最近使用文件记录，可分别勾选
 - 开机自启时只驻留菜单栏；**手动打开（Finder 双击 / Dock / `open`）会直接弹出设置窗口**
 - 默认注册 **⌘⌥K** 直接打开设置窗口，可在设置里关掉
+- 自动检查更新：每 6 小时查一次 GitHub Release，发现新版本在设置页和菜单栏提示，点一下开下载页
 - 图标与设置窗口都按 macOS 26/27 的 Liquid Glass 风格重新设计
 - 配置是一个 JSON 文件，改完点「重新加载配置」即生效
 
@@ -50,6 +51,14 @@
 - 显示菜单栏图标 / 显示 Dock 图标
 - ⌘⌥K 打开设置窗口（可关）
 - 两个隐藏开关都关掉时，这里会显示橙色兜底提示
+- **关于**：当前版本、「检查更新」按钮、自动检查开关；发现新版本时多出一个「下载 vX.Y.Z」按钮
+
+### 检查更新
+
+- 启动 8 秒后查一次（距上次检查超过 6 小时才查），之后每 6 小时一次；可在设置里关掉自动检查
+- 数据来源是 GitHub：先读 `releases/latest`，仓库还没有 Release 时退回读 `tags`；两者都没有就显示「仓库还没有发布版本」
+- 版本号按段比数字（`v1.2.0` > `1.0`），直接开 Release 页面下载，不做静默替换
+- 菜单栏也有「检查更新…」，有新版本时会多一条「有新版本 vX.Y.Z…」
 
 **常用工具**（默认页）：
 
@@ -118,6 +127,9 @@ $APP --open Finder           # 单独测试某个 target 能否被打开
 $APP --settings              # 启动并直接打开设置窗口
 $APP --tools-check           # 只读检查清理目标（列出文件、报告是否有完全磁盘访问权限）
 $APP --range-test            # 用临时库验证各时间范围的删除结果（不动真实历史）
+$APP --version               # 打印当前版本
+$APP --update-check          # 立刻查一次更新（顺带打印版本比较自检）
+$APP --update-fixture        # 用一段示例 Release JSON 验证解析与版本比较
 $APP --login-status          # 查看是否已装开机自启
 $APP --login-on/--login-off  # 安装 / 移除开机自启（LaunchAgent）
 $APP --snapshot out.png      # 离屏渲染设置界面（检查排版），--page tools|launcher|settings 选页
@@ -185,6 +197,15 @@ rm -f ~/Library/Logs/mac-kit.log
 
 开过「登录时自动启动」的话，先在设置窗口里关掉再删。若在系统设置里给过完全磁盘访问权限，记得一并取消。
 
+## 发布新版本
+
+App 内检查的是 GitHub 上的 Release，所以发版要做两件事：
+
+1. 把 `Info.plist` 的 `CFBundleShortVersionString` 改成新版本号（`CFBundleVersion` 递增）
+2. 在 GitHub 上打 tag `vX.Y.Z` 并建一个 Release（附件可选，检查更新只读 tag 和 release 页面）
+
+没有 Release 时检查更新会显示「仓库还没有发布版本」，不会误报。
+
 ## 实现要点
 
 - `AppDelegate` 安装 `NSStatusItem` 和 Carbon 事件处理器；热键回调通过 `GetEventParameter(typeEventHotKeyID)` 拿到 id 查表
@@ -193,6 +214,7 @@ rm -f ~/Library/Logs/mac-kit.log
 - 设置窗口是 `NSHostingView(SwiftUI)` 套在 `NSGlassEffectView` 里，窗口 `titlebarAppearsTransparent` + `fullSizeContentView`
 - 侧栏选中项、清空确认弹窗都存在 `MacKitModel`（`@Published`）里，没有用 `@State`——纯 Command Line Tools 环境没有 SwiftUI 宏插件，`@State` 编译不过
 - 菜单栏图标与 Dock 图标分别由 `NSStatusItem.isVisible` 和 `NSApp.setActivationPolicy(_:)` 控制，状态存 `UserDefaults`
+- 更新检查用 `URLSession` 直连 GitHub API，未认证调用（限流 60 次/小时）；拿到 tag 后只比较版本号，更新交给用户在浏览器完成，不做自替换
 - 两个保留热键用 Carbon 单独注册：`⌥⌘,`（兜底开设置）和 `⌘⌥K`（开设置，可在设置里关）；`⌘⌥K` 被别的 App 占用时开关会回退并提示
 - 开机自启用自己写的 LaunchAgent（`~/Library/LaunchAgents/com.kaix.mac-kit.plist`，`RunAtLoad` + `--login` 参数），不用 `SMAppService`：登录时靠这个参数判断「不是用户手动打开的」，就不弹设置窗口；再次启动已在运行的实例走 `applicationShouldHandleReopen`
 - 记录清理只看两处：`~/Library/Safari/History.db*` 和 `~/Library/Application Support/com.apple.sharedfilelist/` 下的 `RecentDocuments` / `RecentApplications` / 各 App 的 `.sfl3`；TCC 拦截时目录本身读不到，据此判定需要完全磁盘访问权限

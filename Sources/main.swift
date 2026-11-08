@@ -183,6 +183,26 @@ enum Preferences {
         set { UserDefaults.standard.set(newValue, forKey: collapseOnLaunchKey) }
     }
 
+    private static let toggleItemKey = "menuBarToggleVisible"
+    private static let separatorItemKey = "menuBarSeparatorVisible"
+
+    /// 是否显示折叠用的箭头按钮 / 分隔线
+    static var menuBarToggleVisible: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: toggleItemKey) == nil { return true }
+            return UserDefaults.standard.bool(forKey: toggleItemKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: toggleItemKey) }
+    }
+
+    static var menuBarSeparatorVisible: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: separatorItemKey) == nil { return true }
+            return UserDefaults.standard.bool(forKey: separatorItemKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: separatorItemKey) }
+    }
+
     private static let autoUpdateKey = "autoUpdateCheck"
     private static let lastUpdateKey = "lastUpdateCheck"
 
@@ -516,6 +536,8 @@ final class MacKitModel: ObservableObject {
     // 菜单栏图标折叠
     @Published var menuBarCollapsed: Bool = false
     @Published var collapseOnLaunch: Bool = Preferences.collapseOnLaunch
+    @Published var menuBarToggleVisible: Bool = Preferences.menuBarToggleVisible
+    @Published var menuBarSeparatorVisible: Bool = Preferences.menuBarSeparatorVisible
 
     // 更新检查
     @Published var autoUpdateCheck: Bool = Preferences.autoUpdateCheck
@@ -601,6 +623,8 @@ final class MacKitModel: ObservableObject {
     var onOpenUpdate: () -> Void = {}
     var onToggleMenuBarCollapse: () -> Void = {}
     var onToggleCollapseOnLaunch: () -> Void = {}
+    var onToggleMenuBarToggleVisible: () -> Void = {}
+    var onToggleMenuBarSeparatorVisible: () -> Void = {}
 }
 
 // MARK: - SwiftUI 界面
@@ -608,6 +632,7 @@ final class MacKitModel: ObservableObject {
 enum SettingsPage: String, CaseIterable, Identifiable {
     case tools
     case launcher
+    case menuBar
     case settings
 
     var id: String { rawValue }
@@ -616,6 +641,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         switch self {
         case .tools: return "常用工具"
         case .launcher: return "快捷启动"
+        case .menuBar: return "状态栏隐藏"
         case .settings: return "基础设置"
         }
     }
@@ -624,6 +650,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         switch self {
         case .tools: return "wand.and.stars"
         case .launcher: return "command"
+        case .menuBar: return "menubar.rectangle"
         case .settings: return "gearshape"
         }
     }
@@ -745,6 +772,8 @@ struct SettingsView: View {
                 toolsPage
             case .launcher:
                 launcherPage
+            case .menuBar:
+                menuBarPage
             case .settings:
                 appSettingsPage
             }
@@ -764,6 +793,65 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 14) {
             sectionLabel("快捷键")
             shortcutList
+        }
+    }
+
+    @ViewBuilder
+    private var menuBarPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            sectionLabel("折叠")
+
+            VStack(spacing: 6) {
+                HStack(spacing: 10) {
+                    Label("当前状态", systemImage: model.menuBarCollapsed ? "chevron.right.circle" : "chevron.left.circle")
+                        .font(.system(size: 13))
+                    Spacer()
+                    Text(model.menuBarCollapsed ? "已折叠" : "已展开")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    Button {
+                        model.onToggleMenuBarCollapse()
+                    } label: {
+                        Label(model.menuBarCollapsed ? "展开" : "折叠",
+                              systemImage: model.menuBarCollapsed ? "chevron.right" : "chevron.left")
+                            .font(.system(size: 12))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(.quaternary.opacity(0.4))
+                )
+
+                settingRow("启动时折叠", symbol: "arrow.uturn.left", isOn: Binding(
+                    get: { model.collapseOnLaunch },
+                    set: { _ in model.onToggleCollapseOnLaunch() }
+                ))
+            }
+
+            sectionLabel("菜单栏上的按钮")
+            VStack(spacing: 6) {
+                settingRow("显示折叠箭头", symbol: "chevron.left", isOn: Binding(
+                    get: { model.menuBarToggleVisible },
+                    set: { _ in model.onToggleMenuBarToggleVisible() }
+                ))
+                settingRow("显示分隔线", symbol: "minus", isOn: Binding(
+                    get: { model.menuBarSeparatorVisible },
+                    set: { _ in model.onToggleMenuBarSeparatorVisible() }
+                ))
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Label("⌘ 拖动菜单栏上的细线，把它放到「想隐藏的图标」和「箭头」之间", systemImage: "info.circle")
+                Label("两个开关都关掉后，仍可从菜单「折叠菜单栏图标」或 ⌘⌥K 打开这里操作", systemImage: "info.circle")
+            }
+            .font(.system(size: 10))
+            .foregroundStyle(.tertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 4)
         }
     }
 
@@ -1006,6 +1094,7 @@ struct SettingsView: View {
         case .tools: return toolsFooterText
         case .settings: return "修改即时生效"
         case .launcher: return model.status
+        case .menuBar: return "点箭头即可折叠 / 展开"
         }
     }
 
@@ -1085,20 +1174,6 @@ struct SettingsView: View {
                 get: { model.selfHotkeyEnabled },
                 set: { _ in model.onToggleSelfHotkey() }
             ))
-            settingRow("折叠菜单栏图标", symbol: "chevron.left", isOn: Binding(
-                get: { model.menuBarCollapsed },
-                set: { _ in model.onToggleMenuBarCollapse() }
-            ))
-            settingRow("启动时折叠", symbol: "arrow.uturn.left", isOn: Binding(
-                get: { model.collapseOnLaunch },
-                set: { _ in model.onToggleCollapseOnLaunch() }
-            ))
-
-            Label("⌘ 拖动菜单栏上那条细线，把它放到想折叠的图标左边", systemImage: "info.circle")
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 12)
 
             if !model.showMenuBarIcon && !model.showDockIcon {
                 Label("两者都已隐藏，用 ⌥⌘, 打开这个窗口", systemImage: "exclamationmark.triangle")
@@ -1638,6 +1713,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onOpenUpdate = { [weak self] in self?.openUpdatePage() }
         model.onToggleMenuBarCollapse = { [weak self] in self?.toggleMenuBarCollapse() }
         model.onToggleCollapseOnLaunch = { [weak self] in self?.toggleCollapseOnLaunch() }
+        model.onToggleMenuBarToggleVisible = { [weak self] in self?.toggleMenuBarToggleItem() }
+        model.onToggleMenuBarSeparatorVisible = { [weak self] in self?.toggleMenuBarSeparatorItem() }
     }
 
     // MARK: 菜单栏图标折叠
@@ -1652,8 +1729,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         self.hider = hider
         if Preferences.collapseOnLaunch { hider.setCollapsed(true) }
+        hider.toggle.isVisible = Preferences.menuBarToggleVisible
+        hider.separator.isVisible = Preferences.menuBarSeparatorVisible
         model.menuBarCollapsed = hider.isCollapsed
         model.collapseOnLaunch = Preferences.collapseOnLaunch
+        model.menuBarToggleVisible = Preferences.menuBarToggleVisible
+        model.menuBarSeparatorVisible = Preferences.menuBarSeparatorVisible
     }
 
     private func toggleMenuBarCollapse() {
@@ -1666,6 +1747,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Preferences.collapseOnLaunch.toggle()
         model.collapseOnLaunch = Preferences.collapseOnLaunch
         lastMessage = Preferences.collapseOnLaunch ? "启动时自动折叠菜单栏" : "启动时不折叠菜单栏"
+        Log.write(lastMessage)
+        syncModel()
+        rebuildMenu()
+    }
+
+    private func toggleMenuBarToggleItem() {
+        Preferences.menuBarToggleVisible.toggle()
+        model.menuBarToggleVisible = Preferences.menuBarToggleVisible
+        hider?.toggle.isVisible = Preferences.menuBarToggleVisible
+        lastMessage = Preferences.menuBarToggleVisible ? "已显示折叠箭头" : "已隐藏折叠箭头"
+        Log.write(lastMessage)
+        syncModel()
+        rebuildMenu()
+    }
+
+    private func toggleMenuBarSeparatorItem() {
+        Preferences.menuBarSeparatorVisible.toggle()
+        model.menuBarSeparatorVisible = Preferences.menuBarSeparatorVisible
+        hider?.separator.isVisible = Preferences.menuBarSeparatorVisible
+        lastMessage = Preferences.menuBarSeparatorVisible ? "已显示分隔线" : "已隐藏分隔线"
         Log.write(lastMessage)
         syncModel()
         rebuildMenu()

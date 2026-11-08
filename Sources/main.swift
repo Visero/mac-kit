@@ -175,6 +175,14 @@ enum Preferences {
         set { UserDefaults.standard.set(newValue, forKey: selfHotkeyKey) }
     }
 
+    private static let collapseOnLaunchKey = "collapseMenuBarOnLaunch"
+
+    /// 启动时自动折叠菜单栏图标
+    static var collapseOnLaunch: Bool {
+        get { UserDefaults.standard.bool(forKey: collapseOnLaunchKey) }
+        set { UserDefaults.standard.set(newValue, forKey: collapseOnLaunchKey) }
+    }
+
     private static let autoUpdateKey = "autoUpdateCheck"
     private static let lastUpdateKey = "lastUpdateCheck"
 
@@ -505,6 +513,10 @@ final class MacKitModel: ObservableObject {
     @Published var draggingPage: SettingsPage?
     @Published var selfHotkeyEnabled: Bool = Preferences.selfHotkeyEnabled
 
+    // 菜单栏图标折叠
+    @Published var menuBarCollapsed: Bool = false
+    @Published var collapseOnLaunch: Bool = Preferences.collapseOnLaunch
+
     // 更新检查
     @Published var autoUpdateCheck: Bool = Preferences.autoUpdateCheck
     @Published var updateStatus: String = ""
@@ -587,6 +599,8 @@ final class MacKitModel: ObservableObject {
     var onCheckUpdate: () -> Void = {}
     var onToggleAutoUpdate: () -> Void = {}
     var onOpenUpdate: () -> Void = {}
+    var onToggleMenuBarCollapse: () -> Void = {}
+    var onToggleCollapseOnLaunch: () -> Void = {}
 }
 
 // MARK: - SwiftUI 界面
@@ -1071,6 +1085,20 @@ struct SettingsView: View {
                 get: { model.selfHotkeyEnabled },
                 set: { _ in model.onToggleSelfHotkey() }
             ))
+            settingRow("折叠菜单栏图标", symbol: "chevron.left", isOn: Binding(
+                get: { model.menuBarCollapsed },
+                set: { _ in model.onToggleMenuBarCollapse() }
+            ))
+            settingRow("启动时折叠", symbol: "arrow.uturn.left", isOn: Binding(
+                get: { model.collapseOnLaunch },
+                set: { _ in model.onToggleCollapseOnLaunch() }
+            ))
+
+            Label("⌘ 拖动菜单栏上那条细线，把它放到想折叠的图标左边", systemImage: "info.circle")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
 
             if !model.showMenuBarIcon && !model.showDockIcon {
                 Label("两者都已隐藏，用 ⌥⌘, 打开这个窗口", systemImage: "exclamationmark.triangle")
@@ -1281,6 +1309,76 @@ private let hotKeyCallback: EventHandlerUPP = { _, event, userData in
     return noErr
 }
 
+// MARK: - 菜单栏图标折叠（类似 Hidden Bar）
+
+/// 一条可 ⌘ 拖动的分隔线 + 一个箭头：分隔线左侧的图标在折叠时被顶出屏幕
+final class MenuBarHider {
+    let separator: NSStatusItem
+    let toggle: NSStatusItem
+    private(set) var isCollapsed = false
+
+    var onToggle: (() -> Void)?
+
+    private let separatorWidth: CGFloat = 8
+    private let expandedWidth: CGFloat = 10000
+
+    init() {
+        separator = NSStatusBar.system.statusItem(withLength: 8)
+        separator.autosaveName = "MacKitHiddenSeparatorTS"
+        if let button = separator.button {
+            button.image = Self.separatorImage()
+            button.toolTip = "⌘ 拖动这条细线，划分要折叠的图标"
+        }
+
+        toggle = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        toggle.autosaveName = "MacKitHiderToggleTS"
+        if let button = toggle.button {
+            button.image = Self.chevron(collapsed: false)
+            button.toolTip = "折叠菜单栏图标"
+        }
+
+        // 两个 item 建好之后再挂 target，避免 init 里提前使用 self
+        separator.button?.target = self
+        separator.button?.action = #selector(toggleFromSeparator)
+        toggle.button?.target = self
+        toggle.button?.action = #selector(toggleFromSeparator)
+    }
+
+    private static func separatorImage() -> NSImage {
+        let size = NSSize(width: 1, height: 14)
+        let image = NSImage(size: size, flipped: false) { rect in
+            NSColor.black.setFill()
+            rect.fill()
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+
+    private static func chevron(collapsed: Bool) -> NSImage? {
+        let name = collapsed ? "chevron.right" : "chevron.left"
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: collapsed ? "展开菜单栏图标" : "折叠菜单栏图标")
+        image?.isTemplate = true
+        return image
+    }
+
+    func setCollapsed(_ collapsed: Bool) {
+        isCollapsed = collapsed
+        separator.length = collapsed ? expandedWidth : separatorWidth
+        toggle.button?.image = Self.chevron(collapsed: collapsed)
+        toggle.button?.toolTip = collapsed ? "展开菜单栏图标" : "折叠菜单栏图标"
+    }
+
+    func toggleCollapsed() {
+        setCollapsed(!isCollapsed)
+        onToggle?()
+    }
+
+    @objc private func toggleFromSeparator() {
+        toggleCollapsed()
+    }
+}
+
 // MARK: - 检查更新（GitHub Release）
 
 enum UpdateChecker {
@@ -1443,6 +1541,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastMessage = "就绪"
     private var appearanceObservation: NSKeyValueObservation?
     private var updateTimer: Timer?
+    private var hider: MenuBarHider?
     private var settingsHotKeyRef: EventHotKeyRef?
     private var selfHotKeyRef: EventHotKeyRef?
     private var settingsWindow: SettingsWindowController?
@@ -1469,6 +1568,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyIcon(for: NSApp.effectiveAppearance)
         observeAppearance()
         setupStatusItem()
+        setupMenuBarHider()
         installCarbonHandler()
         registerSettingsHotKey()
         if Preferences.selfHotkeyEnabled { _ = registerSelfHotKey() }
@@ -1477,6 +1577,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         loadConfig()
         rebuildMenu()
         scheduleUpdateChecks()
+
 
         let forceSettings = CommandLine.arguments.contains("--settings")
         if forceSettings || !launchedAtLogin {
@@ -1535,6 +1636,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onCheckUpdate = { [weak self] in self?.checkForUpdates(manual: true) }
         model.onToggleAutoUpdate = { [weak self] in self?.toggleAutoUpdate() }
         model.onOpenUpdate = { [weak self] in self?.openUpdatePage() }
+        model.onToggleMenuBarCollapse = { [weak self] in self?.toggleMenuBarCollapse() }
+        model.onToggleCollapseOnLaunch = { [weak self] in self?.toggleCollapseOnLaunch() }
+    }
+
+    // MARK: 菜单栏图标折叠
+
+    private func setupMenuBarHider() {
+        let hider = MenuBarHider()
+        hider.onToggle = { [weak self] in
+            guard let self = self, let hider = self.hider else { return }
+            self.model.menuBarCollapsed = hider.isCollapsed
+            Log.write(hider.isCollapsed ? "折叠菜单栏图标" : "展开菜单栏图标")
+            self.rebuildMenu()
+        }
+        self.hider = hider
+        if Preferences.collapseOnLaunch { hider.setCollapsed(true) }
+        model.menuBarCollapsed = hider.isCollapsed
+        model.collapseOnLaunch = Preferences.collapseOnLaunch
+    }
+
+    private func toggleMenuBarCollapse() {
+        hider?.toggleCollapsed()
+        model.menuBarCollapsed = hider?.isCollapsed ?? false
+        rebuildMenu()
+    }
+
+    private func toggleCollapseOnLaunch() {
+        Preferences.collapseOnLaunch.toggle()
+        model.collapseOnLaunch = Preferences.collapseOnLaunch
+        lastMessage = Preferences.collapseOnLaunch ? "启动时自动折叠菜单栏" : "启动时不折叠菜单栏"
+        Log.write(lastMessage)
+        syncModel()
+        rebuildMenu()
+    }
+
+    @objc private func toggleCollapseFromMenu() {
+        toggleMenuBarCollapse()
     }
 
     // MARK: 检查更新
@@ -1897,6 +2035,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         loginItem.state = isLoginItemEnabled() ? .on : .off
         menu.addItem(loginItem)
 
+        let collapseItem = item(
+            model.menuBarCollapsed ? "展开菜单栏图标" : "折叠菜单栏图标",
+            #selector(toggleCollapseFromMenu),
+            model.menuBarCollapsed ? "chevron.right" : "chevron.left",
+            key: ""
+        )
+        collapseItem.state = model.menuBarCollapsed ? .on : .off
+        menu.addItem(collapseItem)
+
         menu.addItem(.separator())
         menu.addItem(item("退出 MacKit", #selector(quit), "", key: "q"))
 
@@ -1927,7 +2074,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func reloadConfig() {
         loadConfig()
         rebuildMenu()
-        scheduleUpdateChecks()
     }
 
     @objc private func openConfig() {

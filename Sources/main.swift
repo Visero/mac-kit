@@ -183,6 +183,14 @@ enum Preferences {
         set { UserDefaults.standard.set(newValue, forKey: collapseOnLaunchKey) }
     }
 
+    private static let keepAppsKey = "menuBarKeepBundleIDs"
+
+    /// macOS 27 方案下保留在菜单栏的 App（bundle id）
+    static var keepBundleIDs: [String] {
+        get { UserDefaults.standard.stringArray(forKey: keepAppsKey) ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: keepAppsKey) }
+    }
+
     private static let toggleItemKey = "menuBarToggleVisible"
     private static let separatorItemKey = "menuBarSeparatorVisible"
 
@@ -537,6 +545,30 @@ final class MacKitModel: ObservableObject {
     @Published var menuBarCollapsed: Bool = false
     @Published var collapseOnLaunch: Bool = Preferences.collapseOnLaunch
     @Published var menuBarToggleVisible: Bool = Preferences.menuBarToggleVisible
+    @Published var keepBundleIDs: [String] = Preferences.keepBundleIDs
+
+    struct AppEntry: Identifiable, Hashable {
+        let id: String
+        let name: String
+    }
+
+    @Published var runningApps: [AppEntry] = []
+
+    func refreshRunningApps() {
+        let own = Bundle.main.bundleIdentifier
+        let apps = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy != .prohibited }
+            .compactMap { app -> AppEntry? in
+                guard let id = app.bundleIdentifier,
+                      id != own,
+                      !id.hasPrefix("com.apple.") else { return nil }
+                return AppEntry(id: id, name: app.localizedName ?? id)
+            }
+        var seen = Set<String>()
+        runningApps = apps
+            .filter { seen.insert($0.id).inserted }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
     @Published var menuBarSeparatorVisible: Bool = Preferences.menuBarSeparatorVisible
 
     // 更新检查
@@ -624,6 +656,7 @@ final class MacKitModel: ObservableObject {
     var onToggleMenuBarCollapse: () -> Void = {}
     var onToggleCollapseOnLaunch: () -> Void = {}
     var onToggleMenuBarToggleVisible: () -> Void = {}
+    var onToggleKeepApp: (String) -> Void = { _ in }
     var onToggleMenuBarSeparatorVisible: () -> Void = {}
 }
 
@@ -832,26 +865,79 @@ struct SettingsView: View {
                 ))
             }
 
+            if MenuBarHider.usesNativeEngine {
+                sectionLabel("保留在菜单栏的 App")
+                keepAppsList
+                Text("其余 App 的图标会被系统隐藏；时钟、Wi-Fi、控制中心等系统项始终保留。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 4)
+            }
+
             sectionLabel("菜单栏上的按钮")
             VStack(spacing: 6) {
                 settingRow("显示折叠箭头", symbol: "chevron.left", isOn: Binding(
                     get: { model.menuBarToggleVisible },
                     set: { _ in model.onToggleMenuBarToggleVisible() }
                 ))
-                settingRow("显示分隔线", symbol: "minus", isOn: Binding(
-                    get: { model.menuBarSeparatorVisible },
-                    set: { _ in model.onToggleMenuBarSeparatorVisible() }
-                ))
+                if !MenuBarHider.usesNativeEngine {
+                    settingRow("显示分隔线", symbol: "minus", isOn: Binding(
+                        get: { model.menuBarSeparatorVisible },
+                        set: { _ in model.onToggleMenuBarSeparatorVisible() }
+                    ))
+                }
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Label("⌘ 拖动菜单栏上的细线，把它放到「想隐藏的图标」和「箭头」之间", systemImage: "info.circle")
+                if MenuBarHider.usesNativeEngine {
+                    Label("macOS 27 方案：由系统按白名单隐藏图标，任意显示器、刘海屏都有效", systemImage: "info.circle")
+                } else {
+                    Label("⌘ 拖动菜单栏上的细线，把它放到「想隐藏的图标」和「箭头」之间", systemImage: "info.circle")
+                }
                 Label("两个开关都关掉后，仍可从菜单「折叠菜单栏图标」或 ⌘⌥K 打开这里操作", systemImage: "info.circle")
             }
             .font(.system(size: 10))
             .foregroundStyle(.tertiary)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 4)
+        }
+    }
+
+    @ViewBuilder
+    private var keepAppsList: some View {
+        let content = VStack(spacing: 4) {
+            if model.runningApps.isEmpty {
+                Text("没有可选的 App")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 6)
+            }
+            ForEach(model.runningApps) { app in
+                HStack(spacing: 10) {
+                    Text(app.name)
+                        .font(.system(size: 12))
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    GlassSwitch(isOn: Binding(
+                        get: { model.keepBundleIDs.contains(app.id) },
+                        set: { _ in model.onToggleKeepApp(app.id) }
+                    ))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(.quaternary.opacity(0.3))
+                )
+            }
+        }
+
+        if model.runningApps.count > 6 {
+            ScrollView { content }
+                .frame(height: 176)
+        } else {
+            content
         }
     }
 
@@ -1384,6 +1470,42 @@ private let hotKeyCallback: EventHandlerUPP = { _, event, userData in
     return noErr
 }
 
+// MARK: - macOS 27 菜单栏可见性（私有框架桥接）
+
+enum NativeVisibility {
+    static var isAvailable: Bool { MBVisibilityAvailable() }
+
+    final class Assertion {
+        private var handle: UnsafeMutableRawPointer?
+
+        init(_ handle: UnsafeMutableRawPointer) {
+            self.handle = handle
+        }
+
+        func invalidate() {
+            guard let handle = handle else { return }
+            MBVisibilityRelease(handle)
+            self.handle = nil
+        }
+
+        deinit {
+            invalidate()
+        }
+    }
+
+    /// 只保留系统项和这些 App 的菜单栏图标
+    static func activate(keep bundleIDs: [String], completion: @escaping (Result<Assertion, Error>) -> Void) {
+        let systemItems = (0..<64).map { NSNumber(value: $0) }
+        MBVisibilityActivate(systemItems, bundleIDs) { assertion, error in
+            if let assertion = assertion {
+                completion(.success(Assertion(assertion)))
+            } else {
+                completion(.failure(error ?? NSError(domain: "MacKit", code: 1)))
+            }
+        }
+    }
+}
+
 // MARK: - 菜单栏图标折叠（类似 Hidden Bar）
 
 /// 一条可 ⌘ 拖动的分隔线 + 一个箭头：分隔线左侧的图标在折叠时被顶出屏幕
@@ -1393,9 +1515,15 @@ final class MenuBarHider {
     private(set) var isCollapsed = false
 
     var onToggle: (() -> Void)?
+    /// 原生方案下要保留在菜单栏的 App
+    var keepBundleIDs: [String] = []
 
+    private var assertion: NativeVisibility.Assertion?
     private let separatorWidth: CGFloat = 8
     private let expandedWidth: CGFloat = 10000
+
+    /// macOS 27 起用系统可见性白名单，老系统仍用撑宽分隔条
+    static var usesNativeEngine: Bool { NativeVisibility.isAvailable }
 
     init() {
         separator = NSStatusBar.system.statusItem(withLength: 8)
@@ -1438,10 +1566,51 @@ final class MenuBarHider {
     }
 
     func setCollapsed(_ collapsed: Bool) {
-        isCollapsed = collapsed
-        separator.length = collapsed ? expandedWidth : separatorWidth
-        toggle.button?.image = Self.chevron(collapsed: collapsed)
-        toggle.button?.toolTip = collapsed ? "展开菜单栏图标" : "折叠菜单栏图标"
+        guard Self.usesNativeEngine else {
+            isCollapsed = collapsed
+            separator.length = collapsed ? expandedWidth : separatorWidth
+            applyIcon()
+            return
+        }
+
+        if collapsed {
+            guard assertion == nil else { return }
+            var keep = keepBundleIDs
+            if let own = Bundle.main.bundleIdentifier { keep.append(own) }
+            NativeVisibility.activate(keep: keep) { [weak self] result in
+                guard let self = self else { return }
+                switch result {
+                case .success(let assertion):
+                    self.assertion = assertion
+                    self.isCollapsed = true
+                    Log.write("已隐藏其它菜单栏图标（保留 \(keep.count) 个）")
+                case .failure(let error):
+                    self.isCollapsed = false
+                    Log.write("隐藏菜单栏图标失败：\(error.localizedDescription)")
+                }
+                self.applyIcon()
+                self.onToggle?()
+            }
+        } else {
+            assertion?.invalidate()
+            assertion = nil
+            isCollapsed = false
+            Log.write("已恢复菜单栏图标")
+            applyIcon()
+            onToggle?()
+        }
+    }
+
+    private func applyIcon() {
+        toggle.button?.image = Self.chevron(collapsed: isCollapsed)
+        toggle.button?.toolTip = isCollapsed ? "展开菜单栏图标" : "折叠菜单栏图标"
+    }
+
+    /// 退出前解除限制，避免菜单栏停在被隐藏的状态
+    func reset() {
+        assertion?.invalidate()
+        assertion = nil
+        isCollapsed = false
     }
 
     func toggleCollapsed() {
@@ -1667,6 +1836,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         unregisterAll()
         if let ref = settingsHotKeyRef { UnregisterEventHotKey(ref) }
         unregisterSelfHotKey()
+        hider?.reset()
     }
 
     // MARK: 图标
@@ -1715,6 +1885,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onToggleCollapseOnLaunch = { [weak self] in self?.toggleCollapseOnLaunch() }
         model.onToggleMenuBarToggleVisible = { [weak self] in self?.toggleMenuBarToggleItem() }
         model.onToggleMenuBarSeparatorVisible = { [weak self] in self?.toggleMenuBarSeparatorItem() }
+        model.onToggleKeepApp = { [weak self] bundleID in self?.toggleKeepApp(bundleID) }
     }
 
     // MARK: 菜单栏图标折叠
@@ -1727,10 +1898,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.write(hider.isCollapsed ? "折叠菜单栏图标" : "展开菜单栏图标")
             self.rebuildMenu()
         }
+        hider.keepBundleIDs = Preferences.keepBundleIDs
         self.hider = hider
         if Preferences.collapseOnLaunch { hider.setCollapsed(true) }
         hider.toggle.isVisible = Preferences.menuBarToggleVisible
-        hider.separator.isVisible = Preferences.menuBarSeparatorVisible
+        hider.separator.isVisible = MenuBarHider.usesNativeEngine ? false : Preferences.menuBarSeparatorVisible
         model.menuBarCollapsed = hider.isCollapsed
         model.collapseOnLaunch = Preferences.collapseOnLaunch
         model.menuBarToggleVisible = Preferences.menuBarToggleVisible
@@ -1770,6 +1942,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Log.write(lastMessage)
         syncModel()
         rebuildMenu()
+    }
+
+    private func toggleKeepApp(_ bundleID: String) {
+        var keep = Preferences.keepBundleIDs
+        if let index = keep.firstIndex(of: bundleID) {
+            keep.remove(at: index)
+        } else {
+            keep.append(bundleID)
+        }
+        Preferences.keepBundleIDs = keep
+        model.keepBundleIDs = keep
+        hider?.keepBundleIDs = keep
+        // 已经隐藏时改名单，先展开再重新折叠，让改动立即生效
+        if model.menuBarCollapsed {
+            hider?.setCollapsed(false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.hider?.setCollapsed(true)
+            }
+        }
     }
 
     @objc private func toggleCollapseFromMenu() {
@@ -2014,6 +2205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @discardableResult
     private func registerSelfHotKey() -> Bool {
         unregisterSelfHotKey()
+        hider?.reset()
         var ref: EventHotKeyRef?
         let hotKeyID = EventHotKeyID(signature: hotKeySignature, id: selfHotKeyID)
         let status = RegisterEventHotKey(
@@ -2043,6 +2235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func toggleSelfHotkey() {
         if Preferences.selfHotkeyEnabled {
             unregisterSelfHotKey()
+        hider?.reset()
             Preferences.selfHotkeyEnabled = false
             lastMessage = "已关闭 ⌘⌥K"
         } else {
@@ -2169,6 +2362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsWindow = controller
         }
         syncModel()
+        model.refreshRunningApps()
         settingsWindow?.present()
     }
 
@@ -2282,6 +2476,15 @@ func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
     }
     model.icon = AppIconAsset.light
     model.updateStatus = "已是最新"
+    if page == .menuBar {
+        model.runningApps = [
+            MacKitModel.AppEntry(id: "com.apple.Safari", name: "Safari"),
+            MacKitModel.AppEntry(id: "com.tencent.xinWeChat", name: "微信"),
+            MacKitModel.AppEntry(id: "com.github.wez.wezterm", name: "WezTerm"),
+            MacKitModel.AppEntry(id: "app.yuxino.mimi", name: "mimi")
+        ]
+        model.keepBundleIDs = ["com.apple.Safari"]
+    }
     if page == .tools {
         if CommandLine.arguments.contains("--fda") {
             model.toolsStatus = "Safari 浏览记录：没有访问权限\n最近使用文件记录：没有访问权限"
@@ -2334,6 +2537,35 @@ func runLoginToggle(_ action: String) -> Never {
         break
     }
     print("自启状态: \(LoginAgent.isEnabled ? "开启" : "关闭")")
+    exit(0)
+}
+
+// MARK: - 菜单栏隐藏自检（--visibility-test，隐藏 12 秒后自动恢复）
+
+func runVisibilityTest() -> Never {
+    print("原生引擎可用: \(NativeVisibility.isAvailable)")
+    guard NativeVisibility.isAvailable else {
+        print("当前系统不支持：需要 macOS 27 及以上")
+        exit(1)
+    }
+    var done = false
+    NativeVisibility.activate(keep: ["com.kaix.mac-kit"]) { result in
+        switch result {
+        case .success(let assertion):
+            print("已激活可见性限制，12 秒后恢复（其它第三方图标应消失）")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                assertion.invalidate()
+                print("已恢复")
+                done = true
+            }
+        case .failure(let error):
+            print("激活失败：\(error.localizedDescription)")
+            done = true
+        }
+    }
+    while !done {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+    }
     exit(0)
 }
 
@@ -2459,6 +2691,7 @@ if CommandLine.arguments.contains("--range-test") {
     runRangeTest()
 }
 
+if CommandLine.arguments.contains("--visibility-test") { runVisibilityTest() }
 if CommandLine.arguments.contains("--version") { runVersionCheck() }
 if CommandLine.arguments.contains("--update-check") { runUpdateCheck() }
 if CommandLine.arguments.contains("--update-fixture") { runUpdateFixtureTest() }

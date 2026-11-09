@@ -183,12 +183,12 @@ enum Preferences {
         set { UserDefaults.standard.set(newValue, forKey: collapseOnLaunchKey) }
     }
 
-    private static let keepAppsKey = "menuBarKeepBundleIDs"
+    private static let hiddenAppsKey = "menuBarHiddenBundleIDs"
 
-    /// macOS 27 方案下保留在菜单栏的 App（bundle id）
-    static var keepBundleIDs: [String] {
-        get { UserDefaults.standard.stringArray(forKey: keepAppsKey) ?? [] }
-        set { UserDefaults.standard.set(newValue, forKey: keepAppsKey) }
+    /// macOS 27 方案下要隐藏的 App（bundle id）；其余运行中的 App 保持可见
+    static var hiddenBundleIDs: [String] {
+        get { UserDefaults.standard.stringArray(forKey: hiddenAppsKey) ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: hiddenAppsKey) }
     }
 
     private static let toggleItemKey = "menuBarToggleVisible"
@@ -545,7 +545,7 @@ final class MacKitModel: ObservableObject {
     @Published var menuBarCollapsed: Bool = false
     @Published var collapseOnLaunch: Bool = Preferences.collapseOnLaunch
     @Published var menuBarToggleVisible: Bool = Preferences.menuBarToggleVisible
-    @Published var keepBundleIDs: [String] = Preferences.keepBundleIDs
+    @Published var hiddenBundleIDs: [String] = Preferences.hiddenBundleIDs
 
     struct AppEntry: Identifiable, Hashable {
         let id: String
@@ -866,9 +866,9 @@ struct SettingsView: View {
             }
 
             if MenuBarHider.usesNativeEngine {
-                sectionLabel("保留在菜单栏的 App")
+                sectionLabel("需要隐藏的 App")
                 keepAppsList
-                Text("其余 App 的图标会被系统隐藏；时钟、Wi-Fi、控制中心等系统项始终保留。")
+                Text("勾选的 App 图标会被隐藏，其余保留；时钟、Wi-Fi、控制中心等系统项始终保留。")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
                     .padding(.horizontal, 4)
@@ -920,7 +920,7 @@ struct SettingsView: View {
                         .lineLimit(1)
                     Spacer(minLength: 8)
                     GlassSwitch(isOn: Binding(
-                        get: { model.keepBundleIDs.contains(app.id) },
+                        get: { model.hiddenBundleIDs.contains(app.id) },
                         set: { _ in model.onToggleKeepApp(app.id) }
                     ))
                 }
@@ -1515,8 +1515,10 @@ final class MenuBarHider {
     private(set) var isCollapsed = false
 
     var onToggle: (() -> Void)?
-    /// 原生方案下要保留在菜单栏的 App
-    var keepBundleIDs: [String] = []
+    /// 原生方案下要隐藏的 App
+    var hiddenBundleIDs: [String] = []
+    /// 当前运行中的 App（用于推算白名单：没被勾选隐藏的都保留）
+    var runningBundleIDs: () -> [String] = { [] }
 
     private var assertion: NativeVisibility.Assertion?
     private let separatorWidth: CGFloat = 8
@@ -1575,8 +1577,7 @@ final class MenuBarHider {
 
         if collapsed {
             guard assertion == nil else { return }
-            var keep = keepBundleIDs
-            if let own = Bundle.main.bundleIdentifier { keep.append(own) }
+            let keep = allowedBundleIDs()
             NativeVisibility.activate(keep: keep) { [weak self] result in
                 guard let self = self else { return }
                 switch result {
@@ -1599,6 +1600,15 @@ final class MenuBarHider {
             applyIcon()
             onToggle?()
         }
+    }
+
+    /// 白名单 = 运行中且没被勾选隐藏的 App，加上自己
+    private func allowedBundleIDs() -> [String] {
+        var allowed = runningBundleIDs().filter { !hiddenBundleIDs.contains($0) }
+        if let own = Bundle.main.bundleIdentifier, !allowed.contains(own) {
+            allowed.append(own)
+        }
+        return allowed
     }
 
     private func applyIcon() {
@@ -1885,7 +1895,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onToggleCollapseOnLaunch = { [weak self] in self?.toggleCollapseOnLaunch() }
         model.onToggleMenuBarToggleVisible = { [weak self] in self?.toggleMenuBarToggleItem() }
         model.onToggleMenuBarSeparatorVisible = { [weak self] in self?.toggleMenuBarSeparatorItem() }
-        model.onToggleKeepApp = { [weak self] bundleID in self?.toggleKeepApp(bundleID) }
+        model.onToggleKeepApp = { [weak self] bundleID in self?.toggleHiddenApp(bundleID) }
     }
 
     // MARK: 菜单栏图标折叠
@@ -1898,7 +1908,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.write(hider.isCollapsed ? "折叠菜单栏图标" : "展开菜单栏图标")
             self.rebuildMenu()
         }
-        hider.keepBundleIDs = Preferences.keepBundleIDs
+        hider.hiddenBundleIDs = Preferences.hiddenBundleIDs
+        hider.runningBundleIDs = {
+            NSWorkspace.shared.runningApplications.compactMap { $0.bundleIdentifier }
+        }
         self.hider = hider
         if Preferences.collapseOnLaunch { hider.setCollapsed(true) }
         hider.toggle.isVisible = Preferences.menuBarToggleVisible
@@ -1944,16 +1957,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
-    private func toggleKeepApp(_ bundleID: String) {
-        var keep = Preferences.keepBundleIDs
-        if let index = keep.firstIndex(of: bundleID) {
-            keep.remove(at: index)
+    private func toggleHiddenApp(_ bundleID: String) {
+        var hidden = Preferences.hiddenBundleIDs
+        if let index = hidden.firstIndex(of: bundleID) {
+            hidden.remove(at: index)
         } else {
-            keep.append(bundleID)
+            hidden.append(bundleID)
         }
-        Preferences.keepBundleIDs = keep
-        model.keepBundleIDs = keep
-        hider?.keepBundleIDs = keep
+        Preferences.hiddenBundleIDs = hidden
+        model.hiddenBundleIDs = hidden
+        hider?.hiddenBundleIDs = hidden
         // 已经隐藏时改名单，先展开再重新折叠，让改动立即生效
         if model.menuBarCollapsed {
             hider?.setCollapsed(false)
@@ -2483,7 +2496,7 @@ func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
             MacKitModel.AppEntry(id: "com.github.wez.wezterm", name: "WezTerm"),
             MacKitModel.AppEntry(id: "app.yuxino.mimi", name: "mimi")
         ]
-        model.keepBundleIDs = ["com.apple.Safari"]
+        model.hiddenBundleIDs = ["com.tencent.xinWeChat", "app.yuxino.mimi"]
     }
     if page == .tools {
         if CommandLine.arguments.contains("--fda") {
@@ -2548,8 +2561,14 @@ func runVisibilityTest() -> Never {
         print("当前系统不支持：需要 macOS 27 及以上")
         exit(1)
     }
+    let hidden = Preferences.hiddenBundleIDs
+    let running = NSWorkspace.shared.runningApplications.compactMap { $0.bundleIdentifier }
+    var keep = running.filter { !hidden.contains($0) }
+    if let own = Bundle.main.bundleIdentifier, !keep.contains(own) { keep.append(own) }
+    print("要隐藏: \(hidden.joined(separator: ", "))")
+    print("保留 \(keep.count) 个 App")
     var done = false
-    NativeVisibility.activate(keep: ["com.kaix.mac-kit"]) { result in
+    NativeVisibility.activate(keep: keep) { result in
         switch result {
         case .success(let assertion):
             print("已激活可见性限制，12 秒后恢复（其它第三方图标应消失）")

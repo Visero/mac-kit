@@ -217,6 +217,34 @@ rm -f ~/Library/Logs/mac-kit.log
 
 开过「登录时自动启动」的话，先在设置窗口里关掉再删。若在系统设置里给过完全磁盘访问权限，记得一并取消。
 
+## 签名与系统权限
+
+`build.sh` 默认用钥匙串里名为 **`MacKit Local Signing`** 的证书签名；找不到就退回 ad-hoc 并打印警告。
+
+区别很关键：
+
+| 签名方式 | 指定要求（designated requirement） | 后果 |
+|---|---|---|
+| ad-hoc（`codesign -s -`） | `cdhash H"..."` | 每次重编译哈希都变，系统当成另一个 App，完全磁盘访问等授权每次都要重给 |
+| 固定证书 | `identifier "com.kaix.mac-kit" and certificate leaf = H"..."` | 只跟 bundle id 和证书走，重建后授权继续有效 |
+
+首次准备（只需一次，证书会留在登录钥匙串里）：
+
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nodes \
+  -subj "/CN=MacKit Local Signing" \
+  -addext "keyUsage=critical,digitalSignature" \
+  -addext "extendedKeyUsage=critical,codeSigning" \
+  -addext "basicConstraints=critical,CA:false"
+openssl pkcs12 -export -inkey key.pem -in cert.pem -out mackit.p12 -passout pass:mackit123 \
+  -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1
+security import mackit.p12 -k ~/Library/Keychains/login.keychain-db -P mackit123 \
+  -T /usr/bin/codesign -T /usr/bin/security
+```
+
+> 证书显示 `CSSMERR_TP_NOT_TRUSTED` 是正常的（自签、未加入信任链），签名和授权匹配都不受影响。
+> 换电脑或清空钥匙串后要重做一次，届时系统权限需要重给一次。
+
 ## 发布新版本
 
 App 内检查的是 GitHub 上的 Release，所以发版要做两件事：

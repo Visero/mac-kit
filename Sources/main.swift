@@ -732,16 +732,22 @@ struct SettingsView: View {
                 }
             }
 
-            Text("⌥⌘, 随时打开设置")
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
-                .padding(.leading, 10)
-
             Spacer(minLength: 0)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("v\(UpdateChecker.currentVersion)（\(UpdateChecker.currentBuild)）")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text("⌥⌘, 随时打开设置")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.leading, 10)
+            .padding(.bottom, 4)
         }
         .padding(.horizontal, 12)
         .padding(.top, 18)
-        .padding(.bottom, 16)
+        .padding(.bottom, 24)
         .frame(maxHeight: .infinity, alignment: .top)
     }
 

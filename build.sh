@@ -23,11 +23,13 @@ swiftc -O -swift-version 5 \
     -import-objc-header Sources/native_visibility.h \
     -framework Cocoa -framework Carbon -framework ServiceManagement \
     -o "$BUNDLE/Contents/MacOS/$APP_NAME" \
-    Sources/main.swift "$BUILD_DIR/native_visibility.o"
+    Sources/main.swift Sources/CloudSync.swift "$BUILD_DIR/native_visibility.o"
 
 echo "==> 打包"
 cp Info.plist "$BUNDLE/Contents/Info.plist"
 cp Resources/*.icns "$BUNDLE/Contents/Resources/"
+test -s Resources/Assets.car
+cp Resources/Assets.car "$BUNDLE/Contents/Resources/Assets.car"
 printf 'APPL????' > "$BUNDLE/Contents/PkgInfo"
 
 # 固定证书签名：ad-hoc 签名的「指定要求」是 cdhash，每次编译都会变，

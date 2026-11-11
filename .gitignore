@@ -1,3 +1,8 @@
+# 可重建的构建与图标中间产物
 build/
-.DS_Store
 *.iconset/
+
+# 本机元数据与 Python 缓存
+.DS_Store
+__pycache__/
+*.py[cod]

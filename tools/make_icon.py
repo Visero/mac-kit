@@ -1,151 +1,171 @@
 #!/usr/bin/env python3
-"""生成 mac-kit 图标（Liquid Glass 风格，亮/暗两套）
+"""生成 MacKit 的 macOS 27 原生图标资源。
 
-层次：投影 → 底色渐变 → 色晕 → 顶部镜面 → 边缘亮环 → 底部厚度 → 字形
+使用 Apple 官方 Icon Composer 渲染器与 actool：
+- Resources/MacKit.icon：透明 ⌘ 图层 + Automatic 背景、高光、投影
+- Resources/Assets.car：actool 编译的 Aqua / DarkAqua 图标栈
+- Resources/MacKit.icns：actool 生成的旧版回退图标
+- Resources/AppIcon.icns / AppIcon-Dark.icns：运行时的亮/暗图标
 """
 
+import json
 import os
+import shutil
+import subprocess
 
-import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 S = 1024
-SS = 4
-CANVAS = S * SS
-INSET = 100 * SS
-N = 5.0
+# actool 的 macOS 回退图标在 256px 画布上占 206px；同一网格在
+# 1024px 上占 824px。ictool 导出的是无外边距的图标表面，不能直接
+# 当作 applicationIconImage，否则运行中 Dock 会比系统图标大一圈。
+MACOS_ICON_BODY = 824
 FONT = "/System/Library/Fonts/SFNS.ttf"
+GLYPH_COLOR = (92, 157, 255, 255)
+GLYPH_RATIO = 0.56
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT_DIR = os.path.join(HERE, "..", "build", "icons")
+ROOT = os.path.dirname(HERE)
+RES_DIR = os.path.join(ROOT, "Resources")
+ICON_DIR = os.path.join(RES_DIR, "MacKit.icon")
+ASSET_DIR = os.path.join(ICON_DIR, "Assets")
+OUT_DIR = os.path.join(ROOT, "build", "icons")
+ASSET_OUT = os.path.join(ROOT, "build", "icon-assets")
+DOCS_DIR = os.path.join(ROOT, "docs")
+
+XCODE_DEVELOPER = "/Applications/Xcode.app/Contents/Developer"
+ICTOOL = "/Applications/Xcode.app/Contents/Applications/Icon Composer.app/Contents/Executables/ictool"
+ACTOOL = os.path.join(XCODE_DEVELOPER, "usr", "bin", "actool")
+ASSET_NAME = "MacKit"
+
+ICON_SIZES = [
+    ("icon_16x16.png", 16),
+    ("icon_16x16@2x.png", 32),
+    ("icon_32x32.png", 32),
+    ("icon_32x32@2x.png", 64),
+    ("icon_64x64.png", 64),
+    ("icon_64x64@2x.png", 128),
+    ("icon_128x128.png", 128),
+    ("icon_128x128@2x.png", 256),
+    ("icon_256x256.png", 256),
+    ("icon_256x256@2x.png", 512),
+    ("icon_512x512.png", 512),
+    ("icon_512x512@2x.png", 1024),
+]
 
 
-def squircle(size, inset, n=N, blur=0.0):
-    half = (size - 2 * inset) / 2
-    c = size / 2
-    y, x = np.mgrid[0:size, 0:size]
-    inside = (np.abs((x - c) / half) ** n + np.abs((y - c) / half) ** n) <= 1.0
-    img = Image.fromarray((inside * 255).astype(np.uint8))
-    if blur:
-        img = img.filter(ImageFilter.GaussianBlur(blur))
-    return img
-
-
-def vgrad(size, top, bottom):
-    """top/bottom 为 (r,g,b,a)"""
-    t = np.linspace(0, 1, size)[:, None, None]
-    top = np.array(top, dtype=np.float64).reshape(1, 1, 4)
-    bottom = np.array(bottom, dtype=np.float64).reshape(1, 1, 4)
-    arr = np.repeat(top * (1 - t) + bottom * t, size, axis=1)
-    return Image.fromarray(arr.clip(0, 255).astype(np.uint8), "RGBA")
-
-
-def rgrad(size, center, radius, color, strength):
-    y, x = np.mgrid[0:size, 0:size]
-    d = np.sqrt((x - center[0]) ** 2 + (y - center[1]) ** 2) / radius
-    a = np.clip(1 - d, 0, 1) ** 2 * strength
-    arr = np.zeros((size, size, 4), dtype=np.float64)
-    arr[..., 0], arr[..., 1], arr[..., 2] = color
-    arr[..., 3] = a * 255
-    return Image.fromarray(arr.clip(0, 255).astype(np.uint8), "RGBA")
-
-
-def clip_to(layer, mask):
-    return Image.composite(layer, Image.new("RGBA", layer.size, (0, 0, 0, 0)), mask)
-
-
-def glyph(size, char, color, ratio=0.46, shadow=None, blur=0, offset=(0, 0)):
-    font = ImageFont.truetype(FONT, int(size * ratio))
+def make_glyph():
+    os.makedirs(ASSET_DIR, exist_ok=True)
+    font = ImageFont.truetype(FONT, int(S * GLYPH_RATIO))
     try:
         font.set_variation_by_axes([700])
     except Exception:
         pass
+    char = "⌘"
     bbox = font.getbbox(char)
-    pos = ((size - (bbox[2] - bbox[0])) / 2 - bbox[0], (size - (bbox[3] - bbox[1])) / 2 - bbox[1])
-
-    layer = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    if shadow:
-        sh = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        ImageDraw.Draw(sh).text((pos[0] + offset[0], pos[1] + offset[1]), char, font=font, fill=shadow)
-        if blur:
-            sh = sh.filter(ImageFilter.GaussianBlur(blur))
-        layer = Image.alpha_composite(layer, sh)
-    ImageDraw.Draw(layer).text(pos, char, font=font, fill=color)
-    return layer
+    pos = ((S - (bbox[2] - bbox[0])) / 2 - bbox[0],
+           (S - (bbox[3] - bbox[1])) / 2 - bbox[1])
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    ImageDraw.Draw(img).text(pos, char, font=font, fill=GLYPH_COLOR)
+    img.save(os.path.join(ASSET_DIR, "MacKit-glyph.png"))
 
 
-def build(p):
-    canvas = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
-
-    # 投影
-    sh_mask = squircle(CANVAS, INSET, blur=10 * SS)
-    sh = Image.new("RGBA", (CANVAS, CANVAS), p["shadow"])
-    sh.putalpha(Image.fromarray((np.array(sh_mask, dtype=np.float64) * p["shadow"][3] / 255).astype(np.uint8)))
-    sh = sh.filter(ImageFilter.GaussianBlur(18 * SS))
-    canvas.alpha_composite(sh, (0, int(10 * SS)))
-
-    mask = squircle(CANVAS, INSET)
-
-    # 底色
-    body = clip_to(vgrad(CANVAS, p["top"], p["bottom"]), mask)
-
-    # 色晕（右下）＋ 顶部冷光
-    body = Image.alpha_composite(body, clip_to(rgrad(CANVAS, (CANVAS * .70, CANVAS * .80), CANVAS * .62, p["glow"], p["glow_alpha"]), mask))
-    body = Image.alpha_composite(body, clip_to(rgrad(CANVAS, (CANVAS * .30, CANVAS * .16), CANVAS * .55, (255, 255, 255), p["top_light"]), mask))
-
-    # 顶部镜面：上半部分白色渐隐
-    body = Image.alpha_composite(body, clip_to(vgrad(CANVAS, (255, 255, 255, p["spec"]), (255, 255, 255, 0)), mask))
-
-    # 斜向玻璃反光：整块玻璃上斜切一道高光
-    streak = vgrad(CANVAS, (255, 255, 255, p["streak"]), (255, 255, 255, 0)).rotate(28, resample=Image.BICUBIC, expand=False)
-    streak = streak.filter(ImageFilter.GaussianBlur(18 * SS))
-    body = Image.alpha_composite(body, clip_to(streak, mask))
-
-    # 边缘亮环
-    ring = np.array(mask, dtype=np.int16) - np.array(squircle(CANVAS, INSET + 7 * SS), dtype=np.int16)
-    ring_img = Image.fromarray(ring.clip(0, 255).astype(np.uint8))
-    body = Image.alpha_composite(body, Image.composite(vgrad(CANVAS, (255, 255, 255, p["rim_top"]), (255, 255, 255, p["rim_bottom"])), Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0)), ring_img))
-
-    # 底部厚度
-    body = Image.alpha_composite(body, clip_to(vgrad(CANVAS, (0, 0, 0, 0), (0, 0, 0, p["bottom_shade"])), mask))
-
-    # 字形
-    body = Image.alpha_composite(body, glyph(CANVAS, "⌘", p["glyph"], shadow=p["glyph_shadow"], blur=5 * SS, offset=(0, 2 * SS)))
-
-    canvas = Image.alpha_composite(canvas, body)
-    return canvas.resize((S, S), Image.LANCZOS)
+def write_icon_json():
+    data = {
+        "fill": "automatic",
+        "groups": [
+            {
+                "layers": [
+                    {"image-name": "MacKit-glyph.png", "name": "MacKit command"}
+                ],
+                "name": "MacKit",
+                "shadow": {"kind": "neutral", "opacity": 0.3},
+                "specular": True,
+            }
+        ],
+        "supported-platforms": {"squares": ["macOS"]},
+    }
+    with open(os.path.join(ICON_DIR, "icon.json"), "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
 
 
-LIGHT = dict(
-    top=(236, 242, 255, 255), bottom=(170, 188, 220, 255),
-    glow=(96, 132, 255), glow_alpha=0.42,
-    top_light=0.30,
-    spec=150, streak=70,
-    rim_top=245, rim_bottom=40,
-    bottom_shade=30,
-    shadow=(20, 28, 52, 90),
-    glyph=(22, 27, 38, 255), glyph_shadow=(255, 255, 255, 120),
-)
+def render_native():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(DOCS_DIR, exist_ok=True)
+    for label, rendition in (("Light", "Default"), ("Dark", "Dark")):
+        out = os.path.join(OUT_DIR, f"AppIcon-{label}-1024.png")
+        subprocess.run([
+            ICTOOL, ICON_DIR,
+            "--export-image",
+            "--output-file", out,
+            "--platform", "macOS",
+            "--rendition", rendition,
+            "--width", str(S), "--height", str(S), "--scale", "1",
+            "--design-generation", "27",
+        ], check=True)
+        surface = Image.open(out).convert("RGBA")
+        img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        inset = (S - MACOS_ICON_BODY) // 2
+        img.alpha_composite(surface.resize((MACOS_ICON_BODY, MACOS_ICON_BODY), Image.LANCZOS),
+                            (inset, inset))
+        img.save(out)
+        img.resize((128, 128), Image.LANCZOS).save(os.path.join(OUT_DIR, f"preview-{label}-128.png"))
+        img.resize((32, 32), Image.LANCZOS).save(os.path.join(OUT_DIR, f"preview-{label}-32.png"))
+        img.save(os.path.join(DOCS_DIR, f"icon-{label.lower()}.png"))
+    return {
+        "Light": Image.open(os.path.join(OUT_DIR, "AppIcon-Light-1024.png")).convert("RGBA"),
+        "Dark": Image.open(os.path.join(OUT_DIR, "AppIcon-Dark-1024.png")).convert("RGBA"),
+    }
 
-DARK = dict(
-    top=(58, 70, 104, 255), bottom=(16, 18, 28, 255),
-    glow=(110, 140, 255), glow_alpha=0.55,
-    top_light=0.16,
-    spec=80, streak=90,
-    rim_top=200, rim_bottom=30,
-    bottom_shade=60,
-    shadow=(0, 0, 0, 150),
-    glyph=(235, 241, 255, 255), glyph_shadow=(0, 0, 0, 140),
-)
+
+def write_legacy_icns(images):
+    for label, asset_name in (("Light", "AppIcon"), ("Dark", "AppIcon-Dark")):
+        iconset = os.path.join(OUT_DIR, f"{asset_name}.iconset")
+        os.makedirs(iconset, exist_ok=True)
+        for filename, px in ICON_SIZES:
+            images[label].resize((px, px), Image.LANCZOS).save(os.path.join(iconset, filename))
+        subprocess.run([
+            "/usr/bin/iconutil", "-c", "icns", iconset,
+            "-o", os.path.join(RES_DIR, f"{asset_name}.icns"),
+        ], check=True)
+
+
+def compile_native():
+    if os.path.isdir(ASSET_OUT):
+        shutil.rmtree(ASSET_OUT)
+    os.makedirs(ASSET_OUT)
+    subprocess.run([
+        ACTOOL, ICON_DIR,
+        "--compile", ASSET_OUT,
+        "--output-format", "human-readable-text",
+        "--notices", "--warnings",
+        "--output-partial-info-plist", os.path.join(ASSET_OUT, "partial.plist"),
+        "--app-icon", ASSET_NAME,
+        "--include-all-app-icons",
+        "--enable-on-demand-resources", "NO",
+        "--development-region", "en",
+        "--target-device", "mac",
+        "--minimum-deployment-target", "26.0",
+        "--platform", "macosx",
+    ], check=True, env={**os.environ, "DEVELOPER_DIR": XCODE_DEVELOPER})
+    for name in ("Assets.car", "MacKit.icns"):
+        src = os.path.join(ASSET_OUT, name)
+        if not os.path.isfile(src) or os.path.getsize(src) == 0:
+            raise SystemExit(f"actool 未生成 {name}")
+        shutil.copy2(src, os.path.join(RES_DIR, name))
 
 
 def main():
-    os.makedirs(OUT_DIR, exist_ok=True)
-    for name, p in (("Light", LIGHT), ("Dark", DARK)):
-        img = build(p)
-        img.save(os.path.join(OUT_DIR, f"AppIcon-{name}-1024.png"))
-        img.resize((128, 128), Image.LANCZOS).save(os.path.join(OUT_DIR, f"preview-{name}-128.png"))
-        img.resize((32, 32), Image.LANCZOS).save(os.path.join(OUT_DIR, f"preview-{name}-32.png"))
-        print("wrote", name)
+    print("生成透明 ⌘ 图层")
+    make_glyph()
+    write_icon_json()
+    print("用 Apple ictool 渲染亮/暗图标")
+    images = render_native()
+    print("用 Apple actool 编译 Assets.car 与回退 icns")
+    compile_native()
+    print("生成运行时 AppIcon icns")
+    write_legacy_icns(images)
+    print("完成：Resources/Assets.car, Resources/MacKit.icns, Resources/AppIcon*.icns, docs/icon-*.png")
 
 
 if __name__ == "__main__":

@@ -2,10 +2,11 @@ import Cocoa
 import Carbon.HIToolbox
 import ServiceManagement
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - 配置模型
 
-struct HotkeyBinding: Codable {
+struct HotkeyBinding: Codable, Equatable {
     var key: String
     var modifiers: [String]
     var target: String
@@ -35,6 +36,100 @@ enum KeyCodes {
         "home": 115, "end": 119, "pageup": 116, "pagedown": 121
     ]
 
+    /// NSEvent.keyCode → config.json 里使用的键名
+    static func name(for keyCode: UInt16) -> String? {
+        switch keyCode {
+        case 0: return "a"
+        case 1: return "s"
+        case 2: return "d"
+        case 3: return "f"
+        case 4: return "h"
+        case 5: return "g"
+        case 6: return "z"
+        case 7: return "x"
+        case 8: return "c"
+        case 9: return "v"
+        case 11: return "b"
+        case 12: return "q"
+        case 13: return "w"
+        case 14: return "e"
+        case 15: return "r"
+        case 16: return "y"
+        case 17: return "t"
+        case 18: return "1"
+        case 19: return "2"
+        case 20: return "3"
+        case 21: return "4"
+        case 22: return "6"
+        case 23: return "5"
+        case 24: return "equal"
+        case 25: return "9"
+        case 26: return "7"
+        case 27: return "minus"
+        case 28: return "8"
+        case 29: return "0"
+        case 30: return "rightbracket"
+        case 31: return "o"
+        case 32: return "u"
+        case 33: return "leftbracket"
+        case 34: return "i"
+        case 35: return "p"
+        case 36: return "return"
+        case 37: return "l"
+        case 38: return "j"
+        case 39: return "quote"
+        case 40: return "k"
+        case 41: return "semicolon"
+        case 42: return "backslash"
+        case 43: return "comma"
+        case 44: return "slash"
+        case 45: return "n"
+        case 46: return "m"
+        case 47: return "period"
+        case 48: return "tab"
+        case 49: return "space"
+        case 50: return "grave"
+        case 51: return "delete"
+        case 53: return "escape"
+        case 96: return "f5"
+        case 97: return "f6"
+        case 98: return "f7"
+        case 99: return "f3"
+        case 100: return "f8"
+        case 101: return "f9"
+        case 103: return "f11"
+        case 109: return "f10"
+        case 111: return "f12"
+        case 115: return "home"
+        case 116: return "pageup"
+        case 118: return "f4"
+        case 119: return "end"
+        case 120: return "f2"
+        case 121: return "pagedown"
+        case 122: return "f1"
+        case 123: return "left"
+        case 124: return "right"
+        case 125: return "down"
+        case 126: return "up"
+        default: return nil
+        }
+    }
+
+    static func canonicalModifier(_ name: String) -> String? {
+        switch name.lowercased() {
+        case "command", "cmd", "⌘": return "command"
+        case "option", "alt", "opt", "⌥": return "option"
+        case "control", "ctrl", "⌃": return "control"
+        case "shift", "⇧": return "shift"
+        default: return nil
+        }
+    }
+
+    static func canonicalModifiers(_ names: [String]) -> [String] {
+        let set = Set(names.compactMap(canonicalModifier))
+        return ["command", "option", "control", "shift"].filter { set.contains($0) }
+    }
+
     static func carbonModifiers(_ names: [String]) -> UInt32 {
         var mods: UInt32 = 0
         for name in names {
@@ -63,8 +158,38 @@ enum KeyCodes {
         return out
     }
 
+    static func keyLabel(_ key: String) -> String {
+        switch key.lowercased() {
+        case "return", "enter": return "↩"
+        case "space": return "Space"
+        case "tab": return "⇥"
+        case "delete", "backspace": return "⌫"
+        case "escape": return "⎋"
+        case "left": return "←"
+        case "right": return "→"
+        case "up": return "↑"
+        case "down": return "↓"
+        case "home": return "Home"
+        case "end": return "End"
+        case "pageup": return "PageUp"
+        case "pagedown": return "PageDown"
+        case "equal", "=": return "="
+        case "minus", "-": return "-"
+        case "comma", ",": return ","
+        case "period", ".": return "."
+        case "slash", "/": return "/"
+        case "semicolon", ";": return ";"
+        case "quote", "'": return "'"
+        case "backslash", "\\": return "\\"
+        case "leftbracket", "[": return "["
+        case "rightbracket", "]": return "]"
+        case "grave", "`": return "`"
+        default: return key.uppercased()
+        }
+    }
+
     static func label(_ binding: HotkeyBinding) -> String {
-        "\(display(binding.modifiers))\(binding.key.uppercased())"
+        "\(display(binding.modifiers))\(keyLabel(binding.key))"
     }
 }
 
@@ -125,6 +250,15 @@ enum AppResolver {
             }
         }
         return nil
+    }
+
+    static func displayName(_ target: String) -> String {
+        guard let url = resolve(target) else { return target }
+        let bundle = Bundle(url: url)
+        let info = bundle?.localizedInfoDictionary ?? bundle?.infoDictionary
+        if let name = info?["CFBundleDisplayName"] as? String, !name.isEmpty { return name }
+        if let name = info?["CFBundleName"] as? String, !name.isEmpty { return name }
+        return url.deletingPathExtension().lastPathComponent
     }
 }
 
@@ -213,6 +347,13 @@ enum Preferences {
 
     private static let autoUpdateKey = "autoUpdateCheck"
     private static let lastUpdateKey = "lastUpdateCheck"
+    private static let quitWhitelistKey = "quitAllWhitelist"
+
+    /// 一键关闭所有 App 时豁免的 bundle id / 路径
+    static var quitAllWhitelist: [String] {
+        get { UserDefaults.standard.stringArray(forKey: quitWhitelistKey) ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: quitWhitelistKey) }
+    }
 
     /// 自动检查更新，默认开启
     static var autoUpdateCheck: Bool {
@@ -517,8 +658,10 @@ enum RecordCleaner {
 final class MacKitModel: ObservableObject {
     struct Row: Identifiable {
         let id = UUID()
+        let index: Int
         let keys: String
         let target: String
+        let name: String
         let resolved: String
         let ok: Bool
     }
@@ -530,13 +673,19 @@ final class MacKitModel: ObservableObject {
     @Published var showMenuBarIcon: Bool = Preferences.showMenuBarIcon
     @Published var showDockIcon: Bool = Preferences.showDockIcon
 
+    /// iCloud 文件夹同步；由 AppDelegate 注入读写当前配置的闭包。
+    let syncEngine = MacKitCloudSyncEngine()
+
     // 设置窗口的侧栏选中项 / 清空确认弹窗
     @Published var page: SettingsPage = .tools
     @Published var showClearConfirm: Bool = false
 
     // 侧栏顺序（可拖动），记住用户排的次序
     @Published var pageOrder: [SettingsPage] = Preferences.sidebarOrder {
-        didSet { Preferences.sidebarOrder = pageOrder }
+        didSet {
+            Preferences.sidebarOrder = pageOrder
+            onSidebarOrderChanged()
+        }
     }
     @Published var draggingPage: SettingsPage?
     @Published var selfHotkeyEnabled: Bool = Preferences.selfHotkeyEnabled
@@ -568,6 +717,125 @@ final class MacKitModel: ObservableObject {
         runningApps = apps
             .filter { seen.insert($0.id).inserted }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    // 一键关闭所有 App：普通前台 App + 白名单豁免
+    struct QuitApp: Identifiable, Hashable {
+        let id: String
+        let name: String
+        let path: String
+    }
+
+    @Published var quitWhitelist: [String] = Preferences.quitAllWhitelist
+    @Published var quitCandidates: [QuitApp] = []
+    @Published var quitStatus: String = ""
+    @Published var quitTargetCount: Int = 0
+    @Published var quitTargetIDs: [String] = []
+    @Published var showQuitAllConfirm: Bool = false
+
+    private static let finderBundleID = "com.apple.finder"
+
+    private func quitIdentifier(for app: NSRunningApplication) -> String? {
+        if let id = app.bundleIdentifier, !id.isEmpty { return id }
+        if let path = app.bundleURL?.path, !path.isEmpty { return path }
+        return nil
+    }
+
+    private func isQuitCandidate(_ app: NSRunningApplication) -> Bool {
+        guard app.activationPolicy == .regular, !app.isTerminated else { return false }
+        guard let id = quitIdentifier(for: app) else { return false }
+        return id != Bundle.main.bundleIdentifier && id != Self.finderBundleID
+    }
+
+    private var quitTargets: [NSRunningApplication] {
+        let whitelist = Set(quitWhitelist)
+        return NSWorkspace.shared.runningApplications.filter { app in
+            guard isQuitCandidate(app), let id = quitIdentifier(for: app) else { return false }
+            return !whitelist.contains(id)
+        }
+    }
+
+    func refreshQuitCandidates() {
+        var seen = Set<String>()
+        quitCandidates = NSWorkspace.shared.runningApplications
+            .filter { isQuitCandidate($0) }
+            .compactMap { app -> QuitApp? in
+                guard let id = quitIdentifier(for: app) else { return nil }
+                return QuitApp(
+                    id: id,
+                    name: app.localizedName ?? id,
+                    path: app.bundleURL?.path ?? ""
+                )
+            }
+            .filter { seen.insert($0.id).inserted }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func toggleQuitWhitelist(_ id: String) {
+        if let index = quitWhitelist.firstIndex(of: id) {
+            quitWhitelist.remove(at: index)
+        } else {
+            quitWhitelist.append(id)
+        }
+        Preferences.quitAllWhitelist = quitWhitelist
+        onQuitWhitelistChanged()
+    }
+
+    /// 应用来自同步文件夹的设置；此时不应再把它当成新的本机改动。
+    func applySyncedPreferences(sidebarOrder: [SettingsPage], quitWhitelist: [String]) {
+        if pageOrder != sidebarOrder { pageOrder = sidebarOrder }
+        if self.quitWhitelist != quitWhitelist { self.quitWhitelist = quitWhitelist }
+        Preferences.quitAllWhitelist = quitWhitelist
+    }
+
+    func requestQuitAllApps() {
+        refreshQuitCandidates()
+        let targets = quitTargets
+        quitTargetCount = targets.count
+        quitTargetIDs = targets.compactMap { quitIdentifier(for: $0) }
+        guard !targets.isEmpty else {
+            quitStatus = "没有需要关闭的 App"
+            return
+        }
+        quitStatus = ""
+        showQuitAllConfirm = true
+    }
+
+    func confirmQuitAllApps() {
+        let ids = Set(quitTargetIDs)
+        let whitelist = Set(quitWhitelist)
+        let targets = NSWorkspace.shared.runningApplications.filter { app in
+            guard isQuitCandidate(app), let id = quitIdentifier(for: app) else { return false }
+            return ids.contains(id) && !whitelist.contains(id)
+        }
+        quitTargetIDs = []
+        guard !targets.isEmpty else {
+            quitStatus = "没有需要关闭的 App"
+            return
+        }
+
+        var requested = 0
+        var failed = 0
+        var names: [String] = []
+        for app in targets {
+            if app.terminate() {
+                requested += 1
+                names.append(app.localizedName ?? app.bundleIdentifier ?? "未知 App")
+            } else {
+                failed += 1
+            }
+        }
+
+        if failed == 0 {
+            quitStatus = "已向 \(requested) 个 App 发送退出请求"
+        } else {
+            quitStatus = "已向 \(requested) 个 App 发送退出请求，\(failed) 个未能退出"
+        }
+        Log.write("一键关闭 App：\(quitStatus)")
+        if !names.isEmpty {
+            Log.write("关闭目标：\(names.joined(separator: "、"))")
+        }
+        refreshQuitCandidates()
     }
     @Published var menuBarSeparatorVisible: Bool = Preferences.menuBarSeparatorVisible
 
@@ -643,8 +911,12 @@ final class MacKitModel: ObservableObject {
     }
 
     var onReload: () -> Void = {}
+    var onSidebarOrderChanged: () -> Void = {}
+    var onQuitWhitelistChanged: () -> Void = {}
     var onToggleLogin: () -> Void = {}
     var onOpenConfig: () -> Void = {}
+    var onAddShortcut: (String, [String], String) -> String? = { _, _, _ in nil }
+    var onDeleteShortcut: (Int) -> Void = { _ in }
     var onQuit: () -> Void = {}
     var onCloseWindow: () -> Void = {}
     var onToggleMenuBarIcon: () -> Void = {}
@@ -689,8 +961,14 @@ enum SettingsPage: String, CaseIterable, Identifiable {
     }
 }
 
+final class SettingsViewState: ObservableObject {
+    @Published var showAddShortcut = false
+    @Published var showQuitWhitelist = false
+}
+
 struct SettingsView: View {
     @ObservedObject var model: MacKitModel
+    @StateObject private var viewState = SettingsViewState()
 
     private var page: SettingsPage { model.page }
 
@@ -704,6 +982,21 @@ struct SettingsView: View {
             detail
         }
         .frame(width: 720, height: 620)
+        .sheet(isPresented: $viewState.showAddShortcut) {
+            AddShortcutView(
+                onAdd: { key, modifiers, target in
+                    model.onAddShortcut(key, modifiers, target)
+                },
+                onCancel: {
+                    viewState.showAddShortcut = false
+                }
+            )
+        }
+        .sheet(isPresented: $viewState.showQuitWhitelist) {
+            QuitWhitelistView(model: model) {
+                viewState.showQuitWhitelist = false
+            }
+        }
         .alert("清空这些记录？", isPresented: $model.showClearConfirm) {
             Button("清空", role: .destructive) { model.requestClearRecords() }
             Button("取消", role: .cancel) {}
@@ -735,7 +1028,7 @@ struct SettingsView: View {
             Spacer(minLength: 0)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("v\(UpdateChecker.currentVersion)（\(UpdateChecker.currentBuild)）")
+                Text("v\(UpdateChecker.currentVersion)")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
                 Text("⌥⌘, 随时打开设置")
@@ -952,15 +1245,66 @@ struct SettingsView: View {
             sectionLabel("应用")
             settingsRows
 
+            sectionLabel("同步")
+            MacKitSyncSettingsCard(engine: model.syncEngine)
+
             sectionLabel("关于")
             updateRows
         }
     }
 
+    private var quitAllCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Label("关闭所有 App", systemImage: "rectangle.portrait.and.arrow.right")
+                    .font(.system(size: 13))
+                Spacer(minLength: 6)
+                Text("白名单 \(model.quitWhitelist.count) 个")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Button {
+                    model.refreshQuitCandidates()
+                    viewState.showQuitWhitelist = true
+                } label: {
+                    Text("管理白名单…")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    model.requestQuitAllApps()
+                } label: {
+                    Label("全部关闭", systemImage: "power")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .controlSize(.small)
+            }
+
+            Text("只关闭普通 App；Finder、MacKit 自身始终保留。白名单内的 App 不会被关闭。")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+
+            if !model.quitStatus.isEmpty {
+                Text(model.quitStatus)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(.quaternary.opacity(0.4))
+        )
+    }
+
     private var updateRows: some View {
         VStack(spacing: 6) {
             HStack(spacing: 10) {
-                Label("版本 \(UpdateChecker.currentVersion)（\(UpdateChecker.currentBuild)）", systemImage: "info.circle")
+                Label("版本 \(UpdateChecker.currentVersion)", systemImage: "info.circle")
                     .font(.system(size: 13))
                 Spacer()
                 Text(model.updateStatus)
@@ -1073,6 +1417,15 @@ struct SettingsView: View {
             Text("清空后无法恢复；Finder 的最近列表重启 Finder 后刷新。")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
+
+            sectionLabel("批量关闭")
+            quitAllCard
+                .alert("关闭所有 App？", isPresented: $model.showQuitAllConfirm) {
+                    Button("关闭", role: .destructive) { model.confirmQuitAllApps() }
+                    Button("取消", role: .cancel) {}
+                } message: {
+                    Text("将关闭 \(model.quitTargetCount) 个 App，白名单中的 \(model.quitWhitelist.count) 个会保留。未保存的内容可能弹出保存提示。")
+                }
         }
         .alert("Safari 正在运行", isPresented: $model.showQuitSafariConfirm) {
             Button("退出 Safari 并清空", role: .destructive) { model.quitSafariAndClear() }
@@ -1208,6 +1561,26 @@ struct SettingsView: View {
     @ViewBuilder
     private var shortcutList: some View {
         let content = VStack(spacing: 6) {
+            if model.rows.isEmpty {
+                VStack(spacing: 7) {
+                    Image(systemName: "command")
+                        .font(.system(size: 22, weight: .light))
+                        .foregroundStyle(.tertiary)
+                    Text("还没有快捷键")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text("点下方「添加快捷键」，选择 App 后按下组合键即可。")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 28)
+                .background(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(.quaternary.opacity(0.25))
+                )
+            }
+
             ForEach(model.rows) { row in
                 HStack(spacing: 12) {
                     Text(row.keys)
@@ -1218,8 +1591,9 @@ struct SettingsView: View {
                                 .fill(.quaternary)
                         )
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(row.target)
+                        Text(row.name)
                             .font(.system(size: 13))
+                            .lineLimit(1)
                         Text(row.resolved)
                             .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
@@ -1230,6 +1604,15 @@ struct SettingsView: View {
                     Image(systemName: row.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                         .font(.system(size: 11))
                         .foregroundStyle(row.ok ? Color.green : Color.orange)
+                    Button {
+                        model.onDeleteShortcut(row.index)
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("移除这个快捷键")
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
@@ -1296,12 +1679,12 @@ struct SettingsView: View {
         HStack(spacing: 10) {
             if page == .launcher {
                 Button {
-                    model.onOpenConfig()
+                    viewState.showAddShortcut = true
                 } label: {
-                    Label("编辑配置", systemImage: "square.and.pencil")
+                    Label("添加快捷键", systemImage: "plus")
                         .font(.system(size: 12))
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.borderedProminent)
 
                 Button {
                     model.onReload()
@@ -1318,6 +1701,330 @@ struct SettingsView: View {
                 .font(.system(size: 12))
                 .buttonStyle(.bordered)
         }
+    }
+}
+
+// MARK: - 关闭白名单
+
+private struct QuitWhitelistView: View {
+    @ObservedObject var model: MacKitModel
+    var onClose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("关闭白名单")
+                    .font(.system(size: 16, weight: .semibold, design: .rounded))
+                Text("勾选要保留运行的 App；MacKit 和 Finder 始终保留。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            ScrollView {
+                VStack(spacing: 4) {
+                    if model.quitCandidates.isEmpty {
+                        Text("当前没有运行中的 App")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 12)
+                    }
+
+                    ForEach(model.quitCandidates) { app in
+                        HStack(spacing: 10) {
+                            Image(nsImage: NSWorkspace.shared.icon(forFile: app.path))
+                                .resizable()
+                                .interpolation(.high)
+                                .frame(width: 24, height: 24)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(app.name)
+                                    .font(.system(size: 12))
+                                    .lineLimit(1)
+                                Text(app.id)
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            Spacer(minLength: 8)
+                            GlassSwitch(isOn: Binding(
+                                get: { model.quitWhitelist.contains(app.id) },
+                                set: { _ in model.toggleQuitWhitelist(app.id) }
+                            ))
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(.quaternary.opacity(0.3))
+                        )
+                    }
+                }
+            }
+            .frame(maxHeight: .infinity)
+
+            HStack {
+                Text("已豁免 \(model.quitWhitelist.count) 个 App")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("完成") { onClose() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 480, height: 540)
+        .onAppear { model.refreshQuitCandidates() }
+    }
+}
+
+// MARK: - 添加快捷键
+
+private final class AddShortcutViewState: ObservableObject {
+    @Published var appURL: URL?
+    @Published var key = ""
+    @Published var modifiers: [String] = []
+    @Published var error = ""
+}
+
+private struct AddShortcutView: View {
+    var onAdd: (String, [String], String) -> String?
+    var onCancel: () -> Void
+
+    @StateObject private var state = AddShortcutViewState()
+
+    private var appName: String {
+        guard let url = state.appURL else { return "未选择应用" }
+        let bundle = Bundle(url: url)
+        let info = bundle?.localizedInfoDictionary ?? bundle?.infoDictionary
+        if let name = info?["CFBundleDisplayName"] as? String, !name.isEmpty { return name }
+        if let name = info?["CFBundleName"] as? String, !name.isEmpty { return name }
+        return url.deletingPathExtension().lastPathComponent
+    }
+
+    private var modifierOK: Bool {
+        !Set(KeyCodes.canonicalModifiers(state.modifiers))
+            .isDisjoint(with: ["command", "option", "control"])
+    }
+
+    private var canAdd: Bool {
+        state.appURL != nil && !state.key.isEmpty && modifierOK
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("添加快捷键")
+                    .font(.system(size: 17, weight: .semibold, design: .rounded))
+                Text("选择一个应用，再按下想使用的组合键。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 12) {
+                if let appURL = state.appURL {
+                    Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+                        .resizable()
+                        .interpolation(.high)
+                        .frame(width: 36, height: 36)
+                } else {
+                    Image(systemName: "app.dashed")
+                        .font(.system(size: 24, weight: .light))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 36, height: 36)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(appName)
+                        .font(.system(size: 13, weight: .medium))
+                        .lineLimit(1)
+                    Text(state.appURL?.path ?? "选择一个 .app")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                Spacer(minLength: 8)
+
+                Button("选择…") { chooseApp() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(.quaternary.opacity(0.4))
+            )
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("快捷键")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                KeyRecorderBox(
+                    key: $state.key,
+                    modifiers: $state.modifiers,
+                    onChange: { state.error = "" }
+                )
+                Text("至少包含 ⌘、⌥ 或 ⌃ 中的一个；点击上方按键区域后直接按下组合键。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+
+            if !state.error.isEmpty {
+                Label(state.error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Spacer()
+                Button("取消") { onCancel() }
+                    .keyboardShortcut(.cancelAction)
+                Button("添加") { submit() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canAdd)
+            }
+        }
+        .padding(22)
+        .frame(width: 460)
+    }
+
+    private func chooseApp() {
+        let panel = NSOpenPanel()
+        panel.title = "选择要启动的应用"
+        panel.prompt = "选择"
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.treatsFilePackagesAsDirectories = false
+        if panel.runModal() == .OK, let url = panel.url {
+            state.appURL = url
+            state.error = ""
+        }
+    }
+
+    private func submit() {
+        guard let url = state.appURL else {
+            state.error = "先选择一个应用"
+            return
+        }
+        guard !state.key.isEmpty, modifierOK else {
+            state.error = "快捷键至少需要 ⌘、⌥ 或 ⌃ 中的一个"
+            return
+        }
+        let target = Bundle(url: url)?.bundleIdentifier ?? url.path
+        if let message = onAdd(state.key, state.modifiers, target) {
+            state.error = message
+        } else {
+            onCancel()
+        }
+    }
+}
+
+private struct KeyRecorderBox: View {
+    @Binding var key: String
+    @Binding var modifiers: [String]
+    var onChange: () -> Void
+
+    private var label: String {
+        guard !key.isEmpty else { return "" }
+        return "\(KeyCodes.display(modifiers))\(KeyCodes.keyLabel(key))"
+    }
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(.quaternary.opacity(0.55))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                )
+
+            HStack(spacing: 8) {
+                if key.isEmpty {
+                    Text("点击后按下组合键…")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(label)
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "keyboard")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 12)
+
+            KeyCaptureRepresentable { newKey, newModifiers in
+                key = newKey
+                modifiers = newModifiers
+                onChange()
+            }
+        }
+        .frame(height: 44)
+    }
+}
+
+private struct KeyCaptureRepresentable: NSViewRepresentable {
+    var onCapture: (String, [String]) -> Void
+
+    func makeNSView(context: Context) -> KeyCaptureNSView {
+        let view = KeyCaptureNSView()
+        view.onCapture = onCapture
+        return view
+    }
+
+    func updateNSView(_ nsView: KeyCaptureNSView, context: Context) {
+        nsView.onCapture = onCapture
+    }
+}
+
+private final class KeyCaptureNSView: NSView {
+    var onCapture: ((String, [String]) -> Void)?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func becomeFirstResponder() -> Bool { true }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let window = self.window else { return }
+            window.makeFirstResponder(self)
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { self }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        keyDown(with: event)
+        return true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard let key = KeyCodes.name(for: event.keyCode) else {
+            NSSound.beep()
+            return
+        }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        var modifiers: [String] = []
+        if flags.contains(.control) { modifiers.append("control") }
+        if flags.contains(.option) { modifiers.append("option") }
+        if flags.contains(.command) { modifiers.append("command") }
+        if flags.contains(.shift) { modifiers.append("shift") }
+        onCapture?(key, modifiers)
     }
 }
 
@@ -1806,6 +2513,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var selfHotKeyRef: EventHotKeyRef?
     private var settingsWindow: SettingsWindowController?
     private let model = MacKitModel()
+    private var config = Config(hotkeys: [])
 
     private let configURL: URL = {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -1837,6 +2545,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         loadConfig()
         rebuildMenu()
         scheduleUpdateChecks()
+        model.syncEngine.startIfEnabled()
 
 
         let forceSettings = CommandLine.arguments.contains("--settings")
@@ -1849,6 +2558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        model.syncEngine.flushOnTerminate()
         unregisterAll()
         if let ref = settingsHotKeyRef { UnregisterEventHotKey(ref) }
         unregisterSelfHotKey()
@@ -1862,7 +2572,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.write("图标资源缺失")
             return
         }
-        NSApp.applicationIconImage = image
+        let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        Log.write("应用图标：\(isDark ? "dark" : "light")")
+        // 新系统直接使用 actool 图标栈，保留系统外边距和外观选择。
+        // 手动覆盖只用于不支持 Icon Composer 的旧版 macOS。
+        if #available(macOS 26.0, *),
+           Bundle.main.url(forResource: "Assets", withExtension: "car") != nil {
+            NSApp.applicationIconImage = nil
+        } else {
+            NSApp.applicationIconImage = image
+        }
+        NSApp.dockTile.display()
         model.icon = image
     }
 
@@ -1886,9 +2606,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: 模型回调
 
     private func wireModel() {
-        model.onReload = { [weak self] in self?.loadConfig(); self?.rebuildMenu() }
+        model.onReload = { [weak self] in
+            self?.loadConfig()
+            self?.rebuildMenu()
+            self?.model.syncEngine.noteLocalChange()
+        }
+        model.onSidebarOrderChanged = { [weak self] in self?.model.syncEngine.noteLocalChange() }
+        model.onQuitWhitelistChanged = { [weak self] in self?.model.syncEngine.noteLocalChange() }
+        model.syncEngine.snapshotProvider = { [weak self] in
+            guard let self else {
+                return MacKitSyncSnapshot(hotkeys: [], sidebarOrder: [], quitWhitelist: [])
+            }
+            return MacKitSyncSnapshot(
+                hotkeys: self.config.hotkeys,
+                sidebarOrder: self.model.pageOrder.map(\.rawValue),
+                quitWhitelist: self.model.quitWhitelist
+            )
+        }
+        model.syncEngine.applyRemote = { [weak self] record in
+            guard let self else { return "MacKit 未就绪" }
+            return self.applySyncedSettings(record)
+        }
         model.onToggleLogin = { [weak self] in self?.toggleLoginItem() }
         model.onOpenConfig = { [weak self] in self?.openConfig() }
+        model.onAddShortcut = { [weak self] key, modifiers, target in
+            guard let self = self else { return "MacKit 未就绪" }
+            return self.addShortcut(key: key, modifiers: modifiers, target: target)
+        }
+        model.onDeleteShortcut = { [weak self] index in self?.deleteShortcut(at: index) }
         model.onQuit = { NSApp.terminate(nil) }
         model.onCloseWindow = { [weak self] in self?.settingsWindow?.close() }
         model.onToggleMenuBarIcon = { [weak self] in self?.toggleMenuBarIcon() }
@@ -2077,6 +2822,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(Preferences.showDockIcon ? .regular : .accessory)
         model.showMenuBarIcon = Preferences.showMenuBarIcon
         model.showDockIcon = Preferences.showDockIcon
+        if Preferences.showDockIcon {
+            // 切到 regular 后 Dock 会重新读取 bundle 图标，这里再压一次运行时图标
+            applyIcon(for: NSApp.effectiveAppearance)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                self?.applyIcon(for: NSApp.effectiveAppearance)
+            }
+        }
     }
 
     private func toggleMenuBarIcon() {
@@ -2157,17 +2909,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         do {
-            let config = try JSONDecoder().decode(Config.self, from: data)
+            let loaded = try JSONDecoder().decode(Config.self, from: data)
+            config = loaded
             var registered = 0
             var rows: [MacKitModel.Row] = []
-            for binding in config.hotkeys {
+            for (index, binding) in loaded.hotkeys.enumerated() {
                 let ok = register(binding)
                 if ok { registered += 1 }
                 let resolved = AppResolver.resolve(binding.target)?.path ?? "未找到"
-                rows.append(.init(keys: KeyCodes.label(binding), target: binding.target, resolved: resolved, ok: ok))
+                rows.append(.init(
+                    index: index,
+                    keys: KeyCodes.label(binding),
+                    target: binding.target,
+                    name: AppResolver.displayName(binding.target),
+                    resolved: resolved,
+                    ok: ok
+                ))
                 Log.write("\(ok ? "注册" : "注册失败") \(KeyCodes.label(binding)) → \(binding.target)")
             }
-            lastMessage = "已注册 \(registered)/\(config.hotkeys.count) 个快捷键"
+            lastMessage = "已注册 \(registered)/\(loaded.hotkeys.count) 个快捷键"
             Log.write(lastMessage)
             model.rows = rows
         } catch {
@@ -2199,12 +2959,137 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func writeDefaultConfig() {
         let config = defaultConfig()
+        self.config = config
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? encoder.encode(config) {
             try? data.write(to: configURL)
             Log.write("已生成默认配置: \(configURL.path)")
         }
+    }
+
+    /// 写入 config.json 并重新注册；返回值是给界面显示的错误
+    private func saveConfig(_ newConfig: Config, notifySync: Bool = true) -> String? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            let data = try encoder.encode(newConfig)
+            try data.write(to: configURL, options: .atomic)
+        } catch {
+            let message = "保存配置失败: \(error.localizedDescription)"
+            Log.write(message)
+            return message
+        }
+        config = newConfig
+        loadConfig()
+        if notifySync { model.syncEngine.noteLocalChange() }
+        return nil
+    }
+
+    /// 把同步文件夹里的设置应用到本机；不会反向标记成本机新改动。
+    private func applySyncedSettings(_ record: MacKitSyncRecord) -> String? {
+        let order = normalizedSidebarOrder(record.sidebarOrder)
+        if let error = saveConfig(Config(hotkeys: record.hotkeys), notifySync: false) {
+            return error
+        }
+        model.applySyncedPreferences(sidebarOrder: order, quitWhitelist: record.quitWhitelist)
+        rebuildMenu()
+        Log.write("iCloud 同步：已应用远端设置（快捷键 \(record.hotkeys.count) 条）")
+        return nil
+    }
+
+    private func normalizedSidebarOrder(_ raw: [String]) -> [SettingsPage] {
+        let items = raw.compactMap { SettingsPage(rawValue: $0) }
+        let missing = SettingsPage.allCases.filter { !items.contains($0) }
+        let order = items + missing
+        return order.count == SettingsPage.allCases.count ? order : SettingsPage.allCases
+    }
+
+    private func validateShortcut(key: String, modifiers: [String], target: String, excluding index: Int? = nil) -> String? {
+        let normalizedKey = key.lowercased()
+        guard KeyCodes.map[normalizedKey] != nil else { return "不支持这个按键" }
+        guard AppResolver.resolve(target) != nil else { return "找不到这个应用，请重新选择" }
+
+        let modifierSet = Set(KeyCodes.canonicalModifiers(modifiers))
+        guard !modifierSet.isDisjoint(with: ["command", "option", "control"]) else {
+            return "快捷键至少需要 ⌘、⌥ 或 ⌃ 中的一个"
+        }
+
+        let settingsCombo = Set(["command", "option"])
+        if modifierSet == settingsCombo && normalizedKey == "," {
+            return "⌥⌘, 是打开设置窗口的固定热键"
+        }
+        if modifierSet == settingsCombo && normalizedKey == "k" {
+            return "⌘⌥K 是打开设置窗口的固定热键"
+        }
+
+        for (offset, binding) in config.hotkeys.enumerated() where offset != index {
+            let sameKey = binding.key.lowercased() == normalizedKey
+            let sameModifiers = Set(KeyCodes.canonicalModifiers(binding.modifiers)) == modifierSet
+            if sameKey && sameModifiers {
+                return "这个组合已经绑定到 \(AppResolver.displayName(binding.target))"
+            }
+        }
+        return nil
+    }
+
+    private func isShortcutAvailable(_ binding: HotkeyBinding) -> Bool {
+        guard let code = KeyCodes.map[binding.key.lowercased()] else { return false }
+        var ref: EventHotKeyRef?
+        let hotKeyID = EventHotKeyID(signature: hotKeySignature, id: nextID)
+        let status = RegisterEventHotKey(
+            UInt32(code),
+            KeyCodes.carbonModifiers(binding.modifiers),
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &ref
+        )
+        guard status == noErr, let ref = ref else { return false }
+        UnregisterEventHotKey(ref)
+        return true
+    }
+
+    private func addShortcut(key: String, modifiers: [String], target: String) -> String? {
+        if let error = validateShortcut(key: key, modifiers: modifiers, target: target) {
+            return error
+        }
+
+        let binding = HotkeyBinding(key: key.lowercased(), modifiers: modifiers, target: target)
+        guard isShortcutAvailable(binding) else {
+            return "这个组合已被系统或其他 App 占用"
+        }
+
+        var newConfig = config
+        newConfig.hotkeys.append(binding)
+        if let error = saveConfig(newConfig) {
+            return error
+        }
+
+        lastMessage = "已添加 \(KeyCodes.label(binding)) → \(AppResolver.displayName(target))"
+        Log.write(lastMessage)
+        syncModel()
+        rebuildMenu()
+        return nil
+    }
+
+    private func deleteShortcut(at index: Int) {
+        guard config.hotkeys.indices.contains(index) else { return }
+        let removed = config.hotkeys[index]
+        var newConfig = config
+        newConfig.hotkeys.remove(at: index)
+        if let error = saveConfig(newConfig) {
+            lastMessage = error
+            Log.write(error)
+            syncModel()
+            rebuildMenu()
+            return
+        }
+
+        lastMessage = "已移除 \(KeyCodes.label(removed)) → \(AppResolver.displayName(removed.target))"
+        Log.write(lastMessage)
+        syncModel()
+        rebuildMenu()
     }
 
     private func register(_ binding: HotkeyBinding) -> Bool {
@@ -2317,7 +3202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(header)
 
         for (_, binding) in bindingsByID.sorted(by: { $0.key < $1.key }) {
-            let item = NSMenuItem(title: "\(KeyCodes.label(binding))  →  \(binding.target)", action: nil, keyEquivalent: "")
+            let item = NSMenuItem(title: "\(KeyCodes.label(binding))  →  \(AppResolver.displayName(binding.target))", action: nil, keyEquivalent: "")
             item.isEnabled = false
             menu.addItem(item)
         }
@@ -2388,6 +3273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func reloadConfig() {
         loadConfig()
         rebuildMenu()
+        model.syncEngine.noteLocalChange()
     }
 
     @objc private func openConfig() {
@@ -2482,18 +3368,20 @@ func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
         .appendingPathComponent("config.json")
 
     if let data = try? Data(contentsOf: url), let config = try? JSONDecoder().decode(Config.self, from: data) {
-        model.rows = config.hotkeys.map { binding in
+        model.rows = config.hotkeys.enumerated().map { index, binding in
             let resolved = AppResolver.resolve(binding.target)
             return MacKitModel.Row(
+                index: index,
                 keys: KeyCodes.label(binding),
                 target: binding.target,
+                name: AppResolver.displayName(binding.target),
                 resolved: resolved?.path ?? "未找到",
                 ok: resolved != nil
             )
         }
         model.status = "已注册 \(config.hotkeys.count)/\(config.hotkeys.count) 个快捷键"
     }
-    model.icon = AppIconAsset.light
+    model.icon = AppIconAsset.forAppearance(NSApp.effectiveAppearance)
     model.updateStatus = "已是最新"
     if page == .menuBar {
         model.runningApps = [
@@ -2597,12 +3485,12 @@ func runVisibilityTest() -> Never {
 // MARK: - 版本与更新自检（--version / --update-check）
 
 func runVersionCheck() -> Never {
-    print("MacKit \(UpdateChecker.currentVersion)（\(UpdateChecker.currentBuild)）")
+    print("MacKit \(UpdateChecker.currentVersion)")
     exit(0)
 }
 
 func runUpdateCheck() -> Never {
-    print("当前版本 \(UpdateChecker.currentVersion)（build \(UpdateChecker.currentBuild)）")
+    print("当前版本 \(UpdateChecker.currentVersion)")
     print("版本比较自检: v1.2.0>1.0 → \(UpdateChecker.isNewer("v1.2.0", than: "1.0"))"
           + "，1.0>v1.2.0 → \(UpdateChecker.isNewer("1.0", than: "v1.2.0"))"
           + "，v1.0.1>v1.0 → \(UpdateChecker.isNewer("v1.0.1", than: "v1.0"))")

@@ -10,8 +10,10 @@
 - 开机自启时只驻留菜单栏；**手动打开（Finder 双击 / Dock / `open`）会直接弹出设置窗口**
 - 默认注册 **⌘⌥K** 直接打开设置窗口，可在设置里关掉
 - 菜单栏图标折叠（类似 Hidden Bar）：分隔线左侧的图标可一键收进屏幕外，可设为启动时自动折叠
+- 常用工具里可以一键关闭所有普通前台 App，并支持白名单豁免
+- iCloud 同步：用 iCloud Drive 里的普通文件夹，在 Mac 之间同步快捷键、侧栏顺序和关闭白名单；菜单栏 / Dock 图标等本机偏好不参与同步
 - 自动检查更新：每 6 小时查一次 GitHub Release，发现新版本在设置页和菜单栏提示，点一下开下载页
-- 图标与设置窗口都按 macOS 26/27 的 Liquid Glass 风格重新设计
+- 图标使用 macOS 27 原生分层资源：亮色白底、暗色近黑底，蓝色 ⌘ 带高光与投影；设置窗口保留 Liquid Glass 风格
 - 配置是一个 JSON 文件，改完点「重新加载配置」即生效
 
 | 常用工具 | 快捷启动 | 状态栏隐藏 | 基础设置 |
@@ -20,19 +22,13 @@
 
 ## 图标
 
-图标按 macOS 图标网格绘制：1024 画布、内容区 824、超椭圆（n=5）连续圆角，4 倍超采样后降采样。玻璃层次为：投影 → 底色渐变 → 色晕 → 斜向反光 → 边缘亮环 → 底部厚度 → ⌘ 字形。
+图标用 Apple 官方 Icon Composer 的分层格式制作，源文件在 `Resources/MacKit.icon`：一个透明 ⌘ 图层，Automatic 背景，中性投影（opacity 0.3）和 `specular` 高光。系统在亮色外观下渲染为白底蓝色 ⌘，在暗色外观下渲染为近黑底蓝色 ⌘，边缘和字形带轻微高光。
 
 | 亮色 | 暗色 |
 |---|---|
 | ![亮色图标](docs/icon-light.png) | ![暗色图标](docs/icon-dark.png) |
 
-**自动切换**：启动时和系统外观变化时（KVO `NSApp.effectiveAppearance` + `AppleInterfaceThemeChangedNotification`）切换 `NSApp.applicationIconImage`。设置窗口顶部的图标也会跟着变。
-
-> 限制：`.icns` 格式本身不支持「同一图标多外观」，macOS 26 的图标外观变体（亮/暗/着色）要走 Icon Composer 的 `.icon` + `Assets.car`，而打包 `Assets.car` 需要 Xcode 的 `actool`（本机只装了 Command Line Tools，`actool` 不可用）。所以：
-> - 运行中的 App（Dock、⌘-Tab、关于面板、设置窗口）里图标会跟随亮暗切换；
-> - Finder / 访达 / Launchpad 里显示的静态图标固定用亮色版。
->
-> 等装了 Xcode，用 Icon Composer 打开 `docs/icon-light.png` / `docs/icon-dark.png` 做成 `.icon` 就能做到 Finder 里也自动切换。
+**自动切换**：`Resources/Assets.car` 由 Xcode `actool` 编译，包含 `NSAppearanceNameAqua` / `NSAppearanceNameDarkAqua` 两套原生图标栈；`Info.plist` 的 `CFBundleIconName=MacKit` 让 Finder、Dock、⌘-Tab 直接按系统外观取图。macOS 26+ 不再用运行时位图覆盖系统图标。设置窗口及旧版 macOS 使用 `AppIcon.icns` / `AppIcon-Dark.icns`，由同一组官方渲染图生成；1024 画布内图标表面占 824px、四边各留 100px 透明边距，避免图标被放大。
 
 ## 设置窗口
 
@@ -41,10 +37,17 @@
 - 侧栏四项可以上下拖动换顺序，顺序记在 `UserDefaults` 里
 - 每次打开默认停在**常用工具**页
 
+**常用工具**：
+
+- 清理 Safari 浏览记录、最近使用文件记录，可分别勾选
+- **批量关闭**：点「全部关闭」会先确认，再关闭所有普通前台 App；点「管理白名单…」可勾选要保留运行的 App，白名单存在 `UserDefaults` 的 `quitAllWhitelist` 里。Finder 和 MacKit 自身始终保留
+- 关闭使用正常 `terminate()` 退出请求，不会强杀 App；有未保存内容时仍会弹出保存提示
+
 **快捷启动**：
 
 - 快捷键列表：每条显示按键、目标 App、解析到的真实路径和注册状态（✓ / ⚠）
-- 按钮：编辑配置 / 重新加载 / 退出
+- 底部按钮：添加快捷键 / 重新加载 / 退出
+- 「添加快捷键」会弹出选择面板：选一个 App，再按下组合键即可保存并立即生效；列表右侧的垃圾桶可移除单条快捷键
 
 **基础设置**（App 自身）：
 
@@ -53,6 +56,14 @@
 - ⌘⌥K 打开设置窗口（可关）
 - 两个隐藏开关都关掉时，这里会显示橙色兜底提示
 - **关于**：当前版本、「检查更新」按钮、自动检查开关；发现新版本时多出一个「下载 vX.Y.Z」按钮
+
+**iCloud 同步**（基础设置页的「同步」分组）：
+
+- 只在 iCloud Drive 的 `MacKit/settings.json` 里读写，不申请 iCloud ubiquity container，也不走 CloudKit
+- 同步三项：**快捷键**、**侧栏顺序**、**关闭白名单**。显示菜单栏 / Dock 图标、⌘⌥K、折叠状态、自动检查更新等本机偏好不同步
+- 合并按 `updatedAt` 判断，远端明显新于本机才覆盖；本机保存后会把新记录写回文件，两端最终收敛
+- 本机没有可写的 iCloud Drive 时，可以点「选择文件夹…」指定任意文件夹，MacKit 会在其中创建 `MacKit` 子目录
+- 写入用临时文件 + `rename(2)` 原子替换；遇到损坏或读不到的 `settings.json` 只报错，不会拿本机内容覆盖
 
 **状态栏隐藏**（两套引擎，按系统自动选）：
 
@@ -109,13 +120,15 @@ macOS 27 上隐藏是**按 App 生效**的：一个 App 有多个图标会一起
 | ⌥⌘F | Finder |
 | ⌥⌘X | 微信 |
 
-三个应用都用到时才写入配置（找不到的 App 会被跳过）；想加更多 App，直接往 `config.json` 的 `hotkeys` 数组里加一条，再点「重新加载」。
+三个应用都用到时才写入配置（找不到的 App 会被跳过）。需要更多快捷键时，在「快捷启动」页点「添加快捷键」，选择 App 后按下想用的组合键，保存后立即生效；组合键至少要包含 ⌘、⌥、⌃ 中的一个。
 
-> 组合被系统或别的 App 占用（比如和 Loop 的触发键撞了）时注册会失败，设置窗口里显示 ⚠，日志里写明原因。
+> 组合被系统或别的 App 占用（比如和 Loop 的触发键撞了）、或与已有快捷键重复时，会直接提示，不会写入配置；注册失败时设置窗口里显示 ⚠，日志里写明原因。
 
 ## 配置文件
 
 路径：`~/Library/Application Support/mac-kit/config.json`
+
+日常增删快捷键直接用界面即可，这个文件由 App 自动维护；下面的格式用于迁移、备份或排查。
 
 ```json
 {
@@ -135,6 +148,28 @@ macOS 27 上隐藏是**按 App 生效**的：一个 App 有多个图标会一起
 - `target`：应用名（`kitty`）、Bundle ID（`com.apple.Safari`）或完整路径
 
 **支持的键名**：`a`–`z`、`0`–`9`、`f1`–`f12`、`space`、`tab`、`return`、`escape`、`delete`、`home`、`end`、`pageup`、`pagedown`、方向键、`minus`、`equal`、`leftbracket`、`rightbracket`、`semicolon`、`quote`、`comma`、`period`、`slash`、`backslash`、`grave`
+
+## 同步文件
+
+开启 iCloud 同步后，数据写到：
+
+```
+~/Library/Mobile Documents/com~apple~CloudDocs/MacKit/settings.json
+```
+
+如果系统把 iCloud Drive 挂在 `~/Library/CloudStorage` 下，则使用对应的 iCloud Drive 目录；也可以手动选择其他文件夹，路径变成 `<所选文件夹>/MacKit/settings.json`。
+
+```json
+{
+  "schema": 1,
+  "updatedAt": 1794395008,
+  "hotkeys": [{ "key": "s", "modifiers": ["option", "command"], "target": "Safari" }],
+  "sidebarOrder": ["tools", "launcher", "menuBar", "settings"],
+  "quitWhitelist": ["com.apple.Safari"]
+}
+```
+
+`updatedAt` 是 epoch 秒。两个 Mac 都改过时，更新时间更晚的一方胜出；时间差小于 0.5 秒按本机优先。`schema` 不认识时只读不写，保留本机设置。
 
 ## 命令行
 
@@ -195,14 +230,9 @@ pkill -f 'MacOS/MacKit'
 ## 重新生成图标
 
 ```bash
-# 需要带 Pillow 的 python3
+# 需要带 Pillow 的 python3，以及 Xcode 26/27（Icon Composer 的 ictool + actool）
+# 会生成 Resources/MacKit.icon、Assets.car、MacKit.icns、AppIcon*.icns 和 docs/icon-*.png
 python3 tools/make_icon.py
-
-# 生成 iconset → icns（build.sh 只复制 Resources/ 里的 icns，不会自动跑这两步）
-for v in Light Dark; do
-  # 见 README 历史或 docs/；手工按 16/32/64/128/256/512/1024 生成 iconset 后：
-  iconutil -c icns build/$v.iconset -o Resources/AppIcon-$v.icns
-done
 ```
 
 ## 卸载

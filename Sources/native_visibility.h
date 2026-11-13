@@ -12,15 +12,21 @@
 
 #include <stdbool.h>
 #import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>
+
+// 滚动来源：0 未识别、1 鼠标、2 触控板。
+int MKScrollDeviceKind(CGEventRef _Nonnull event);
+void MKScrollReverseHID(CGEventRef _Nonnull event, bool vertical, bool horizontal);
+bool MKScrollDeviceAPIAvailable(void);
 
 /// 当前系统是否提供该私有框架且接口可用（macOS 27+）
 bool MBVisibilityAvailable(void);
 
 /// 激活限制：只让系统项和 bundleIDs 里的 App 可见。
 /// 成功时通过 handle 返回一个不透明句柄，用完必须 MBVisibilityRelease。
-void MBVisibilityActivate(NSArray<NSNumber *> *systemItems,
-                          NSArray<NSString *> *bundleIDs,
-                          void (^completion)(void *_Nullable handle, NSError * _Nullable error));
+void MBVisibilityActivate(NSArray<NSNumber *> * _Nonnull systemItems,
+                          NSArray<NSString *> * _Nonnull bundleIDs,
+                          void (^ _Nonnull completion)(void *_Nullable handle, NSError * _Nullable error));
 
 /// 解除限制并释放句柄
 void MBVisibilityRelease(void * _Nullable handle);

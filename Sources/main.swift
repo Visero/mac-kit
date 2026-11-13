@@ -1,5 +1,6 @@
 import Cocoa
 import Carbon.HIToolbox
+import ApplicationServices
 import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
@@ -253,6 +254,7 @@ enum AppResolver {
     }
 
     static func displayName(_ target: String) -> String {
+        if target == ShortcutConfiguration.screenSaver { return "启动屏幕保护程序" }
         guard let url = resolve(target) else { return target }
         let bundle = Bundle(url: url)
         let info = bundle?.localizedInfoDictionary ?? bundle?.infoDictionary
@@ -270,12 +272,12 @@ enum AppIconAsset {
         return NSImage(contentsOf: url)
     }
 
-    static var light: NSImage? { named("AppIcon") }
-    static var dark: NSImage? { named("AppIcon-Dark") }
-
     static func forAppearance(_ appearance: NSAppearance) -> NSImage? {
-        let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        return isDark ? (dark ?? light) : (light ?? dark)
+        var image: NSImage?
+        appearance.performAsCurrentDrawingAppearance {
+            image = NSImage(named: NSImage.Name("MacKit")) ?? named("MacKit")
+        }
+        return image
     }
 }
 
@@ -674,7 +676,14 @@ final class MacKitModel: ObservableObject {
     @Published var showDockIcon: Bool = Preferences.showDockIcon
 
     /// iCloud 文件夹同步；由 AppDelegate 注入读写当前配置的闭包。
-    let syncEngine = MacKitCloudSyncEngine()
+    let syncEngine: MacKitCloudSyncEngine
+    let clipboard: ClipboardHistory
+    let scrollReversal = ScrollReversal()
+
+    init(clipboard: ClipboardHistory = ClipboardHistory(), syncEngine: MacKitCloudSyncEngine = MacKitCloudSyncEngine()) {
+        self.clipboard = clipboard
+        self.syncEngine = syncEngine
+    }
 
     // 设置窗口的侧栏选中项 / 清空确认弹窗
     @Published var page: SettingsPage = .tools
@@ -915,6 +924,8 @@ final class MacKitModel: ObservableObject {
     var onQuitWhitelistChanged: () -> Void = {}
     var onToggleLogin: () -> Void = {}
     var onOpenConfig: () -> Void = {}
+    var onOpenLog: () -> Void = {}
+    var onBatchEditShortcuts: () -> Void = {}
     var onAddShortcut: (String, [String], String) -> String? = { _, _, _ in nil }
     var onDeleteShortcut: (Int) -> Void = { _ in }
     var onQuit: () -> Void = {}
@@ -938,6 +949,8 @@ enum SettingsPage: String, CaseIterable, Identifiable {
     case tools
     case launcher
     case menuBar
+    case clipboard
+    case scroll
     case settings
 
     var id: String { rawValue }
@@ -947,6 +960,8 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .tools: return "常用工具"
         case .launcher: return "快捷启动"
         case .menuBar: return "状态栏隐藏"
+        case .clipboard: return "剪贴板"
+        case .scroll: return "滚动反转"
         case .settings: return "基础设置"
         }
     }
@@ -956,6 +971,8 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .tools: return "wand.and.stars"
         case .launcher: return "command"
         case .menuBar: return "menubar.rectangle"
+        case .clipboard: return "doc.on.clipboard"
+        case .scroll: return "arrow.up.arrow.down"
         case .settings: return "gearshape"
         }
     }
@@ -1096,23 +1113,42 @@ struct SettingsView: View {
 
     private var detail: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text(page.title)
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
+            HStack {
+                Text(page.title)
+                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                if page == .clipboard {
+                    Spacer()
+                    Text(model.clipboard.hotkeyStatus).font(.system(size: 11)).foregroundStyle(.secondary)
+                    Button("打开历史") { model.clipboard.onOpen() }
+                        .buttonStyle(.borderedProminent).controlSize(.small)
+                }
+            }
+            .fixedSize(horizontal: false, vertical: true)
 
-            switch page {
-            case .tools:
-                toolsPage
-            case .launcher:
-                launcherPage
-            case .menuBar:
-                menuBarPage
-            case .settings:
-                appSettingsPage
+            if page == .clipboard {
+                // 整页只有一个滚动区域：设置、置顶和历史都能到达，标题和底部不被挤出窗口。
+                ScrollView(.vertical, showsIndicators: true) {
+                    ClipboardSettingsPage(history: model.clipboard)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.trailing, 6)
+                        .padding(.bottom, 8)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+                .accessibilityIdentifier("clipboardSettingsScroll")
+            } else {
+                switch page {
+                case .tools: toolsPage
+                case .launcher: launcherPage
+                case .menuBar: menuBarPage
+                case .clipboard: EmptyView()
+                case .scroll: ScrollSettingsPage(engine: model.scrollReversal)
+                case .settings: appSettingsPage
+                }
+                Spacer(minLength: 0)
             }
 
-            Spacer(minLength: 0)
-
-            footer
+            footer.fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, 22)
         .padding(.top, 18)
@@ -1193,7 +1229,7 @@ struct SettingsView: View {
                 } else {
                     Label("⌘ 拖动菜单栏上的细线，把它放到「想隐藏的图标」和「箭头」之间", systemImage: "info.circle")
                 }
-                Label("两个开关都关掉后，仍可从菜单「折叠菜单栏图标」或 ⌘⌥K 打开这里操作", systemImage: "info.circle")
+                Label("隐藏按钮后，仍可从「偏好设置…」进入状态栏隐藏页，或用 ⌘⌥K 打开主界面", systemImage: "info.circle")
             }
             .font(.system(size: 10))
             .foregroundStyle(.tertiary)
@@ -1241,7 +1277,7 @@ struct SettingsView: View {
     }
 
     private var appSettingsPage: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 6) {
             sectionLabel("应用")
             settingsRows
 
@@ -1250,7 +1286,33 @@ struct SettingsView: View {
 
             sectionLabel("关于")
             updateRows
+
+            sectionLabel("配置与日志")
+            configurationActions
         }
+    }
+
+    private var configurationActions: some View {
+        HStack(spacing: 8) {
+            maintenanceButton("重新加载配置", action: model.onReload)
+            maintenanceButton("配置文件", action: model.onOpenConfig)
+            maintenanceButton("打开日志", action: model.onOpenLog)
+        }
+    }
+
+    private func maintenanceButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11, weight: .medium))
+                .frame(maxWidth: .infinity)
+                .frame(height: 30)
+                .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.quaternary.opacity(0.4))
+        )
     }
 
     private var quitAllCard: some View {
@@ -1304,47 +1366,65 @@ struct SettingsView: View {
     private var updateRows: some View {
         VStack(spacing: 6) {
             HStack(spacing: 10) {
-                Label("版本 \(UpdateChecker.currentVersion)", systemImage: "info.circle")
-                    .font(.system(size: 13))
-                Spacer()
+                settingsLabel("版本 \(UpdateChecker.currentVersion)", symbol: "info.circle")
+                Spacer(minLength: 8)
                 Text(model.updateStatus)
                     .font(.system(size: 11))
                     .foregroundStyle(model.availableUpdate == nil ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.accentColor))
                     .lineLimit(1)
+                    .truncationMode(.tail)
+                Button("检查更新") {
+                    model.onCheckUpdate()
+                }
+                .font(.system(size: 11))
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.vertical, 6)
             .background(
                 RoundedRectangle(cornerRadius: 11, style: .continuous)
                     .fill(.quaternary.opacity(0.4))
             )
 
             HStack(spacing: 10) {
-                Button {
-                    model.onCheckUpdate()
-                } label: {
-                    Label("检查更新", systemImage: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 12))
-                }
-                .buttonStyle(.bordered)
-
-                if let update = model.availableUpdate {
-                    Button {
-                        model.onOpenUpdate()
-                    } label: {
-                        Label("下载 \(update.version)", systemImage: "arrow.down.circle")
-                            .font(.system(size: 12))
-                    }
-                    .buttonStyle(.borderedProminent)
-                }
-
-                Spacer()
+                settingsLabel("自动检查更新", symbol: "clock.arrow.circlepath")
+                Spacer(minLength: 8)
+                GlassSwitch(isOn: Binding(
+                    get: { model.autoUpdateCheck },
+                    set: { _ in model.onToggleAutoUpdate() }
+                ))
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(.quaternary.opacity(0.4))
+            )
 
-            settingRow("自动检查更新", symbol: "clock.arrow.circlepath", isOn: Binding(
-                get: { model.autoUpdateCheck },
-                set: { _ in model.onToggleAutoUpdate() }
-            ))
+            if let update = model.availableUpdate {
+                HStack {
+                    Spacer()
+                    Button("下载 \(update.version)") {
+                        model.onOpenUpdate()
+                    }
+                    .font(.system(size: 11))
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            }
+        }
+    }
+
+    private func settingsLabel(_ title: String, symbol: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol)
+                .font(.system(size: 13, weight: .regular))
+                .frame(width: 18, height: 18)
+            Text(title)
+                .font(.system(size: 13))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
         }
     }
 
@@ -1526,11 +1606,19 @@ struct SettingsView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(footerText)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-
-            actions
+            if page == .clipboard {
+                HStack(spacing: 10) {
+                    Text(footerText).font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Button("退出") { model.onQuit() }.controlSize(.small)
+                }
+            } else {
+                Text(footerText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                actions
+            }
         }
     }
 
@@ -1540,6 +1628,8 @@ struct SettingsView: View {
         case .settings: return "修改即时生效"
         case .launcher: return model.status
         case .menuBar: return "点箭头即可折叠 / 展开"
+        case .clipboard: return "⌥Space 打开历史；回车复制，↑↓ 选择，Esc 关闭"
+        case .scroll: return "设置仅保存在本机，关闭后恢复原滚动方向"
         }
     }
 
@@ -1632,23 +1722,23 @@ struct SettingsView: View {
     }
 
     private var settingsRows: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 4) {
             settingRow("登录时自动启动", symbol: "power", isOn: Binding(
                 get: { model.loginItemEnabled },
                 set: { _ in model.onToggleLogin() }
-            ))
+            ), verticalPadding: 6)
             settingRow("显示菜单栏图标", symbol: "menubar.rectangle", isOn: Binding(
                 get: { model.showMenuBarIcon },
                 set: { _ in model.onToggleMenuBarIcon() }
-            ))
+            ), verticalPadding: 6)
             settingRow("显示 Dock 图标", symbol: "dock.rectangle", isOn: Binding(
                 get: { model.showDockIcon },
                 set: { _ in model.onToggleDockIcon() }
-            ))
+            ), verticalPadding: 6)
             settingRow("⌘⌥K 打开设置窗口", symbol: "keyboard", isOn: Binding(
                 get: { model.selfHotkeyEnabled },
                 set: { _ in model.onToggleSelfHotkey() }
-            ))
+            ), verticalPadding: 6)
 
             if !model.showMenuBarIcon && !model.showDockIcon {
                 Label("两者都已隐藏，用 ⌥⌘, 打开这个窗口", systemImage: "exclamationmark.triangle")
@@ -1660,7 +1750,7 @@ struct SettingsView: View {
         }
     }
 
-    private func settingRow(_ title: String, symbol: String, isOn: Binding<Bool>) -> some View {
+    private func settingRow(_ title: String, symbol: String, isOn: Binding<Bool>, verticalPadding: CGFloat = 8) -> some View {
         HStack {
             Label(title, systemImage: symbol)
                 .font(.system(size: 13))
@@ -1668,7 +1758,7 @@ struct SettingsView: View {
             GlassSwitch(isOn: isOn)
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.vertical, verticalPadding)
         .background(
             RoundedRectangle(cornerRadius: 11, style: .continuous)
                 .fill(.quaternary.opacity(0.4))
@@ -1685,6 +1775,10 @@ struct SettingsView: View {
                         .font(.system(size: 12))
                 }
                 .buttonStyle(.borderedProminent)
+
+                Button("批量编辑") { model.onBatchEditShortcuts() }
+                    .font(.system(size: 12))
+                    .buttonStyle(.bordered)
 
                 Button {
                     model.onReload()
@@ -2161,6 +2255,8 @@ final class SettingsBackgroundView: NSView {
 private let hotKeySignature: OSType = 0x4150_4C4E // 'APLN'
 private let settingsHotKeyID: UInt32 = 0xF000   // 保留 id：⌥⌘, 打开设置窗口
 private let selfHotKeyID: UInt32 = 0xF001       // 保留 id：⌘⌥K 打开设置窗口
+private let clipboardHotKeyID: UInt32 = 0xF002 // ⌥Space 剪贴板
+private let clipboardEntryHotKeyBase: UInt32 = 0xE100 // 剪贴板条目自定义快捷键
 
 private let hotKeyCallback: EventHandlerUPP = { _, event, userData in
     guard let userData = userData else { return noErr }
@@ -2511,7 +2607,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hider: MenuBarHider?
     private var settingsHotKeyRef: EventHotKeyRef?
     private var selfHotKeyRef: EventHotKeyRef?
+    private var clipboardHotKeyRef: EventHotKeyRef?
+    private var entryHotKeyRefs: [EventHotKeyRef] = []
+    private var entryIDsByHotKey: [UInt32: String] = [:]
+    private var clipboardPanel: ClipboardPanelController?
     private var settingsWindow: SettingsWindowController?
+    private var shortcutBatchEditor: ShortcutBatchEditor?
     private let model = MacKitModel()
     private var config = Config(hotkeys: [])
 
@@ -2541,6 +2642,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerSettingsHotKey()
         if Preferences.selfHotkeyEnabled { _ = registerSelfHotKey() }
         wireModel()
+        registerClipboardHotKey()
+        model.clipboard.start()
+        refreshClipboardShortcuts()
+        model.scrollReversal.start()
         applyPresentation()
         loadConfig()
         rebuildMenu()
@@ -2548,8 +2653,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.syncEngine.startIfEnabled()
 
 
+        if CommandLine.arguments.contains("--clipboard") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.openClipboard() }
+        }
         let forceSettings = CommandLine.arguments.contains("--settings")
-        if forceSettings || !launchedAtLogin {
+        if forceSettings || (!launchedAtLogin && !CommandLine.arguments.contains("--clipboard")) {
             Log.write("手动打开，显示设置窗口")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 self?.openSettings()
@@ -2559,6 +2667,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         model.syncEngine.flushOnTerminate()
+        model.clipboard.stop()
+        model.scrollReversal.stop()
+        if let ref = clipboardHotKeyRef { UnregisterEventHotKey(ref) }
+        unregisterEntryHotKeys()
         unregisterAll()
         if let ref = settingsHotKeyRef { UnregisterEventHotKey(ref) }
         unregisterSelfHotKey()
@@ -2606,6 +2718,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: 模型回调
 
     private func wireModel() {
+        model.clipboard.onOpen = { [weak self] in self?.openClipboard() }
+        model.clipboard.onShortcutsChanged = { [weak self] in self?.refreshClipboardShortcuts() }
         model.onReload = { [weak self] in
             self?.loadConfig()
             self?.rebuildMenu()
@@ -2629,6 +2743,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         model.onToggleLogin = { [weak self] in self?.toggleLoginItem() }
         model.onOpenConfig = { [weak self] in self?.openConfig() }
+        model.onOpenLog = { [weak self] in self?.openLog() }
+        model.onBatchEditShortcuts = { [weak self] in self?.openBatchEditor() }
         model.onAddShortcut = { [weak self] key, modifiers, target in
             guard let self = self else { return "MacKit 未就绪" }
             return self.addShortcut(key: key, modifiers: modifiers, target: target)
@@ -2727,10 +2843,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func toggleCollapseFromMenu() {
-        toggleMenuBarCollapse()
-    }
-
     // MARK: 检查更新
 
     private func scheduleUpdateChecks() {
@@ -2793,14 +2905,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func openUpdatePage() {
         guard let release = model.availableUpdate else { return }
         NSWorkspace.shared.open(release.pageURL)
-    }
-
-    @objc private func checkUpdatesFromMenu() {
-        checkForUpdates(manual: true)
-    }
-
-    @objc private func openUpdateFromMenu() {
-        openUpdatePage()
     }
 
     // MARK: 菜单栏图标
@@ -2883,6 +2987,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func registerClipboardHotKey() {
+        var ref: EventHotKeyRef?
+        let id = EventHotKeyID(signature: hotKeySignature, id: clipboardHotKeyID)
+        let result = RegisterEventHotKey(49, UInt32(optionKey), id, GetApplicationEventTarget(), 0, &ref)
+        if result == noErr, let ref {
+            clipboardHotKeyRef = ref
+            model.clipboard.hotkeyStatus = "⌥Space"
+        } else {
+            model.clipboard.hotkeyStatus = "⌥Space 被占用"
+        }
+    }
+
+    private func openClipboard() {
+        if clipboardPanel == nil { clipboardPanel = ClipboardPanelController(history: model.clipboard) }
+        clipboardPanel?.show()
+    }
+
     private func unregisterAll() {
         for ref in hotKeyRefs {
             UnregisterEventHotKey(ref)
@@ -2944,17 +3065,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func defaultConfig() -> Config {
-        // 默认：⌥⌘S Safari、⌥⌘F Finder、⌥⌘X 微信
-        let defaults: [(key: String, app: String)] = [
-            ("s", "Safari"),
-            ("f", "Finder"),
-            ("x", "WeChat")
-        ]
-        var bindings: [HotkeyBinding] = []
-        for entry in defaults where AppResolver.resolve(entry.app) != nil {
-            bindings.append(HotkeyBinding(key: entry.key, modifiers: ["option", "command"], target: entry.app))
-        }
-        return Config(hotkeys: bindings)
+        ShortcutConfiguration.defaults
     }
 
     private func writeDefaultConfig() {
@@ -2966,6 +3077,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? data.write(to: configURL)
             Log.write("已生成默认配置: \(configURL.path)")
         }
+    }
+
+    private func openBatchEditor() {
+        if let editor = shortcutBatchEditor, editor.window?.isVisible == true {
+            editor.window?.makeKeyAndOrderFront(nil)
+            return
+        }
+        let editor = ShortcutBatchEditor(config: config) { [weak self] text in
+            guard let self else { return "MacKit 未就绪" }
+            return self.applyBatchConfiguration(text)
+        }
+        shortcutBatchEditor = editor
+        editor.present()
+    }
+
+    private func applyBatchConfiguration(_ text: String) -> String? {
+        let candidate: Config
+        do { candidate = try ShortcutConfiguration.parse(text) }
+        catch { return error.localizedDescription }
+        let currentKeys = Set(config.hotkeys.map(ShortcutConfiguration.identity))
+        for binding in candidate.hotkeys where !currentKeys.contains(ShortcutConfiguration.identity(binding)) {
+            if !isShortcutAvailable(binding) { return "\(KeyCodes.label(binding)) 已被系统或其他 App 占用，未修改配置" }
+        }
+        let old = config
+        unregisterAll()
+        for binding in candidate.hotkeys {
+            guard register(binding) else {
+                unregisterAll()
+                for existing in old.hotkeys { _ = register(existing) }
+                return "\(KeyCodes.label(binding)) 注册失败，已恢复原配置"
+            }
+        }
+        do {
+            let data = Data(ShortcutConfiguration.json(candidate).utf8)
+            // 每次只留一份上次配置，用于撤销批量编辑。
+            if let oldData = try? Data(contentsOf: configURL) {
+                try oldData.write(to: configURL.appendingPathExtension("previous"), options: .atomic)
+            }
+            try data.write(to: configURL, options: .atomic)
+        } catch {
+            unregisterAll()
+            for existing in old.hotkeys { _ = register(existing) }
+            return "保存失败，原配置未改变：\(error.localizedDescription)"
+        }
+        config = candidate
+        loadConfig()
+        model.syncEngine.noteLocalChange()
+        lastMessage = "已应用 \(candidate.hotkeys.count) 条快捷键"
+        syncModel()
+        rebuildMenu()
+        return nil
     }
 
     /// 写入 config.json 并重新注册；返回值是给界面显示的错误
@@ -3016,6 +3178,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let settingsCombo = Set(["command", "option"])
+        if modifierSet == Set(["option"]), KeyCodes.map[normalizedKey] == 49 {
+            return "⌥Space 用于打开剪贴板历史"
+        }
         if modifierSet == settingsCombo && normalizedKey == "," {
             return "⌥⌘, 是打开设置窗口的固定热键"
         }
@@ -3159,12 +3324,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: 触发
 
     func fire(id: UInt32) {
+        if let entryID = entryIDsByHotKey[id] { activateClipboardEntry(entryID); return }
+        if id == clipboardHotKeyID { openClipboard(); return }
         if id == settingsHotKeyID || id == selfHotKeyID {
             openSettings()
             return
         }
         guard let binding = bindingsByID[id] else { return }
         launch(binding.target)
+    }
+
+    /// 为带自定义快捷键的剪贴板条目注册全局热键。
+    func refreshClipboardShortcuts() {
+        unregisterEntryHotKeys()
+        var offset: UInt32 = 0
+        for entry in model.clipboard.entries {
+            guard let key = entry.shortcutKey?.lowercased(),
+                  let modifiers = entry.shortcutModifiers, !modifiers.isEmpty,
+                  let code = KeyCodes.map[key] else { continue }
+            let id = clipboardEntryHotKeyBase + offset
+            offset += 1
+            var ref: EventHotKeyRef?
+            let hotKeyID = EventHotKeyID(signature: hotKeySignature, id: id)
+            let status = RegisterEventHotKey(UInt32(code), KeyCodes.carbonModifiers(modifiers), hotKeyID,
+                                             GetApplicationEventTarget(), 0, &ref)
+            guard status == noErr, let ref else {
+                Log.write("剪贴板快捷键被占用：\(entry.shortcutLabel ?? key)")
+                continue
+            }
+            entryHotKeyRefs.append(ref)
+            entryIDsByHotKey[id] = entry.id
+        }
+        if !entryIDsByHotKey.isEmpty { Log.write("已注册 \(entryIDsByHotKey.count) 个剪贴板快捷键") }
+    }
+
+    private func unregisterEntryHotKeys() {
+        for ref in entryHotKeyRefs { UnregisterEventHotKey(ref) }
+        entryHotKeyRefs.removeAll()
+        entryIDsByHotKey.removeAll()
+    }
+
+    private func activateClipboardEntry(_ id: String) {
+        guard let entry = model.clipboard.entry(id: id), model.clipboard.copy(entry) else { return }
+        guard model.clipboard.autoPaste, AXIsProcessTrusted(),
+              let front = NSWorkspace.shared.frontmostApplication,
+              front.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == front.processIdentifier else { return }
+            let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true)
+            let up = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: false)
+            down?.flags = .maskCommand
+            up?.flags = .maskCommand
+            down?.postToPid(front.processIdentifier)
+            up?.postToPid(front.processIdentifier)
+        }
     }
 
     private func launch(_ target: String) {
@@ -3178,6 +3391,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
+        configuration.createsNewApplicationInstance = target == ShortcutConfiguration.screenSaver
         NSWorkspace.shared.openApplication(at: url, configuration: configuration) { [weak self] _, error in
             DispatchQueue.main.async {
                 if let error = error {
@@ -3195,69 +3409,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: 菜单
 
     private func rebuildMenu() {
-        let menu = NSMenu()
-
-        let header = NSMenuItem(title: "快捷键", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-
-        for (_, binding) in bindingsByID.sorted(by: { $0.key < $1.key }) {
-            let item = NSMenuItem(title: "\(KeyCodes.label(binding))  →  \(AppResolver.displayName(binding.target))", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        }
-
-        if bindingsByID.isEmpty {
-            let item = NSMenuItem(title: "（没有可用的快捷键）", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        }
-
-        menu.addItem(.separator())
-
-        let status = NSMenuItem(title: lastMessage, action: nil, keyEquivalent: "")
-        status.isEnabled = false
-        menu.addItem(status)
-
-        menu.addItem(.separator())
-        menu.addItem(item("偏好设置…  ⌥⌘,", #selector(openSettings), "gearshape", key: ","))
-        menu.addItem(item("重新加载配置", #selector(reloadConfig), "arrow.clockwise", key: "r"))
-        menu.addItem(item("打开配置文件…", #selector(openConfig), "doc.text", key: ""))
-        menu.addItem(item("打开日志", #selector(openLog), "text.alignleft", key: ""))
-        menu.addItem(item("检查更新…", #selector(checkUpdatesFromMenu), "arrow.triangle.2.circlepath", key: ""))
-        if let update = model.availableUpdate {
-            menu.addItem(item("有新版本 \(update.version)…", #selector(openUpdateFromMenu), "arrow.down.circle", key: ""))
-        }
-
-        let loginItem = item("开机自启", #selector(toggleLoginItemFromMenu), "", key: "")
-        loginItem.state = isLoginItemEnabled() ? .on : .off
-        menu.addItem(loginItem)
-
-        let collapseItem = item(
-            model.menuBarCollapsed ? "展开菜单栏图标" : "折叠菜单栏图标",
-            #selector(toggleCollapseFromMenu),
-            model.menuBarCollapsed ? "chevron.right" : "chevron.left",
-            key: ""
-        )
-        collapseItem.state = model.menuBarCollapsed ? .on : .off
-        menu.addItem(collapseItem)
-
-        menu.addItem(.separator())
-        menu.addItem(item("退出 MacKit", #selector(quit), "", key: "q"))
-
-        for entry in menu.items where entry.action != nil {
-            entry.target = self
-        }
-
+        let menu = Self.makeStatusMenu(target: self)
         statusItem.menu = menu
     }
 
-    private func item(_ title: String, _ action: Selector, _ symbol: String, key: String) -> NSMenuItem {
-        let entry = NSMenuItem(title: title, action: action, keyEquivalent: key)
-        if !symbol.isEmpty, let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
-            entry.image = image
-        }
-        return entry
+    /// 状态栏只提供主界面入口和退出；设置统一留在主界面。
+    static func makeStatusMenu(target: AnyObject?) -> NSMenu {
+        let menu = NSMenu()
+        let settings = NSMenuItem(title: "偏好设置…", action: #selector(openSettings), keyEquivalent: ",")
+        settings.keyEquivalentModifierMask = [.command, .option]
+        settings.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
+        settings.target = target
+        menu.addItem(settings)
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(title: "退出 MacKit", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = target
+        menu.addItem(quitItem)
+        return menu
     }
 
     @objc private func openSettings() {
@@ -3312,12 +3480,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
-    @objc private func toggleLoginItemFromMenu() {
-        toggleLoginItem()
-    }
 }
 
 // MARK: - 自检模式
+
+func runStatusMenuCheck() -> Never {
+    _ = NSApplication.shared
+    let menu = AppDelegate.makeStatusMenu(target: nil)
+    let actions = menu.items.filter { !$0.isSeparatorItem }
+    guard actions.map(\.title) == ["偏好设置…", "退出 MacKit"],
+          actions.allSatisfy({ $0.action != nil }),
+          actions.first?.keyEquivalentModifierMask == [.command, .option] else {
+        print("✗ 状态栏菜单不符合精简配置")
+        exit(1)
+    }
+    print("✓ 状态栏菜单仅保留偏好设置和退出")
+    print("✓ 设置快捷键 ⌥⌘,，配置、日志、更新及开机自启统一在主界面")
+    exit(0)
+}
 
 func runCheck() -> Never {
     let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -3352,7 +3532,7 @@ func runCheck() -> Never {
     let appearance = NSApp.effectiveAppearance
     let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
     let icon = AppIconAsset.forAppearance(appearance)
-    print("当前外观: \(isDark ? "dark" : "light")，图标: \(icon == nil ? "缺失" : "已加载")（\(isDark ? "AppIcon-Dark.icns" : "AppIcon.icns")）")
+    print("当前外观: \(isDark ? "dark" : "light")，图标: \(icon == nil ? "缺失" : "已加载")（Assets.car / MacKit.icns）")
     print("\(ok)/\(config.hotkeys.count) 个快捷键可用")
     exit(ok == config.hotkeys.count ? 0 : 2)
 }
@@ -3362,12 +3542,17 @@ func runCheck() -> Never {
 @MainActor
 func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
     _ = NSApplication.shared
-    let model = MacKitModel()
+    let demo = CommandLine.arguments.contains("--demo")
+    if demo { NSApp.appearance = NSAppearance(named: .darkAqua) }
+    let demoDefaults = UserDefaults(suiteName: "MacKit-Demo-Settings-\(UUID().uuidString)")!
+    let model = MacKitModel(clipboard: demo ? makeDemoClipboardHistory() : ClipboardHistory(),
+                            syncEngine: MacKitCloudSyncEngine(defaults: demo ? demoDefaults : .standard))
     let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("mac-kit", isDirectory: true)
         .appendingPathComponent("config.json")
 
-    if let data = try? Data(contentsOf: url), let config = try? JSONDecoder().decode(Config.self, from: data) {
+    let snapshotConfig: Config? = demo ? ShortcutConfiguration.defaults : (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Config.self, from: $0) }
+    if let config = snapshotConfig {
         model.rows = config.hotkeys.enumerated().map { index, binding in
             let resolved = AppResolver.resolve(binding.target)
             return MacKitModel.Row(
@@ -3401,6 +3586,7 @@ func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
         }
     }
 
+    if page == .clipboard && !demo { model.clipboard.start() }
     model.page = page
     let view = SettingsView(model: model)
         .background(
@@ -3412,7 +3598,23 @@ func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
         )
         .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
 
-    let renderer = ImageRenderer(content: view)
+    if page == .clipboard {
+        // ImageRenderer 不支持 TextField 等 AppKit 控件，改为真实 HostingView 离屏渲染。
+        let host = NSHostingView(rootView: view)
+        host.frame = NSRect(x: 0, y: 0, width: 720, height: 620)
+        host.layoutSubtreeIfNeeded()
+        if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+            host.cacheDisplay(in: host.bounds, to: rep)
+            if let png = rep.representation(using: .png, properties: [:]) {
+                try? png.write(to: URL(fileURLWithPath: path))
+                print("saved \(path)")
+                exit(0)
+            }
+        }
+        print("render failed")
+        exit(1)
+    }
+    let renderer = ImageRenderer(content: view.environment(\.colorScheme, demo ? .dark : (NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .dark : .light)))
     renderer.scale = 2
     if let image = renderer.nsImage,
        let tiff = image.tiffRepresentation,
@@ -3592,6 +3794,16 @@ func runToolsCheck() -> Never {
 // MARK: - 入口
 
 let app = NSApplication.shared
+if CommandLine.arguments.contains("--print-default-shortcuts") {
+    print(ShortcutConfiguration.json(ShortcutConfiguration.defaults))
+    exit(0)
+}
+if CommandLine.arguments.contains("--shortcut-config-check") { runShortcutConfigurationCheck() }
+if CommandLine.arguments.contains("--scroll-status") { runScrollStatus() }
+if CommandLine.arguments.contains("--scroll-check") { runScrollCheck() }
+if CommandLine.arguments.contains("--clipboard-check") { runClipboardCheck() }
+if CommandLine.arguments.contains("--clipboard-snapshot") { runClipboardSnapshot() }
+if CommandLine.arguments.contains("--menu-check") { runStatusMenuCheck() }
 if CommandLine.arguments.contains("--check") {
     runCheck()
 }

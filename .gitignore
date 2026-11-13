@@ -1,5 +1,6 @@
 # 可重建的构建与图标中间产物
 build/
+releases/
 *.iconset/
 
 # 本机元数据与 Python 缓存

@@ -17,17 +17,20 @@ clang -c -fblocks -O2 -Wno-objc-root-class \
     -target "$(uname -m)-apple-macos13.0" \
     -o "$BUILD_DIR/native_visibility.o" \
     Sources/native_visibility.m
+clang -c -fobjc-arc -O2 \
+    -target "$(uname -m)-apple-macos13.0" \
+    -o "$BUILD_DIR/scroll_device.o" Sources/scroll_device.m
 
 swiftc -O -swift-version 5 \
     -target "$(uname -m)-apple-macos13.0" \
     -import-objc-header Sources/native_visibility.h \
-    -framework Cocoa -framework Carbon -framework ServiceManagement \
+    -framework Cocoa -framework Carbon -framework ServiceManagement -framework IOKit \
     -o "$BUNDLE/Contents/MacOS/$APP_NAME" \
-    Sources/main.swift Sources/CloudSync.swift "$BUILD_DIR/native_visibility.o"
+    Sources/main.swift Sources/CloudSync.swift Sources/ShortcutBatchEditor.swift Sources/ClipboardHistory.swift Sources/ClipboardUI.swift Sources/ScrollReversal.swift "$BUILD_DIR/native_visibility.o" "$BUILD_DIR/scroll_device.o"
 
 echo "==> 打包"
 cp Info.plist "$BUNDLE/Contents/Info.plist"
-cp Resources/*.icns "$BUNDLE/Contents/Resources/"
+cp Resources/MacKit.icns "$BUNDLE/Contents/Resources/MacKit.icns"
 test -s Resources/Assets.car
 cp Resources/Assets.car "$BUNDLE/Contents/Resources/Assets.car"
 printf 'APPL????' > "$BUNDLE/Contents/PkgInfo"

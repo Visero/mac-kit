@@ -5,7 +5,7 @@
 - Resources/MacKit.icon：透明 ⌘ 图层 + Automatic 背景、高光、投影
 - Resources/Assets.car：actool 编译的 Aqua / DarkAqua 图标栈
 - Resources/MacKit.icns：actool 生成的旧版回退图标
-- Resources/AppIcon.icns / AppIcon-Dark.icns：运行时的亮/暗图标
+- docs/icon-light.png / icon-dark.png：文档用亮/暗图标预览
 """
 
 import json
@@ -36,21 +36,6 @@ XCODE_DEVELOPER = "/Applications/Xcode.app/Contents/Developer"
 ICTOOL = "/Applications/Xcode.app/Contents/Applications/Icon Composer.app/Contents/Executables/ictool"
 ACTOOL = os.path.join(XCODE_DEVELOPER, "usr", "bin", "actool")
 ASSET_NAME = "MacKit"
-
-ICON_SIZES = [
-    ("icon_16x16.png", 16),
-    ("icon_16x16@2x.png", 32),
-    ("icon_32x32.png", 32),
-    ("icon_32x32@2x.png", 64),
-    ("icon_64x64.png", 64),
-    ("icon_64x64@2x.png", 128),
-    ("icon_128x128.png", 128),
-    ("icon_128x128@2x.png", 256),
-    ("icon_256x256.png", 256),
-    ("icon_256x256@2x.png", 512),
-    ("icon_512x512.png", 512),
-    ("icon_512x512@2x.png", 1024),
-]
 
 
 def make_glyph():
@@ -118,18 +103,6 @@ def render_native():
     }
 
 
-def write_legacy_icns(images):
-    for label, asset_name in (("Light", "AppIcon"), ("Dark", "AppIcon-Dark")):
-        iconset = os.path.join(OUT_DIR, f"{asset_name}.iconset")
-        os.makedirs(iconset, exist_ok=True)
-        for filename, px in ICON_SIZES:
-            images[label].resize((px, px), Image.LANCZOS).save(os.path.join(iconset, filename))
-        subprocess.run([
-            "/usr/bin/iconutil", "-c", "icns", iconset,
-            "-o", os.path.join(RES_DIR, f"{asset_name}.icns"),
-        ], check=True)
-
-
 def compile_native():
     if os.path.isdir(ASSET_OUT):
         shutil.rmtree(ASSET_OUT)
@@ -160,12 +133,10 @@ def main():
     make_glyph()
     write_icon_json()
     print("用 Apple ictool 渲染亮/暗图标")
-    images = render_native()
+    render_native()
     print("用 Apple actool 编译 Assets.car 与回退 icns")
     compile_native()
-    print("生成运行时 AppIcon icns")
-    write_legacy_icns(images)
-    print("完成：Resources/Assets.car, Resources/MacKit.icns, Resources/AppIcon*.icns, docs/icon-*.png")
+    print("完成：Resources/Assets.car, Resources/MacKit.icns, docs/icon-*.png")
 
 
 if __name__ == "__main__":

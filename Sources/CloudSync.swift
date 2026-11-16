@@ -186,6 +186,17 @@ final class MacKitCloudSyncEngine: ObservableObject {
     static let baseFolderKey = "MacKit.iCloudSyncBaseFolder"
     static let editedAtKey = "MacKit.iCloudSyncEditedAt"
 
+    /// 同步内容开关：每个工具单独控制，改动后立即生效
+    @Published var syncHotkeys: Bool = Preferences.syncHotkeys {
+        didSet { Preferences.syncHotkeys = syncHotkeys }
+    }
+    @Published var syncSidebarOrder: Bool = Preferences.syncSidebarOrder {
+        didSet { Preferences.syncSidebarOrder = syncSidebarOrder }
+    }
+    @Published var syncQuitWhitelist: Bool = Preferences.syncQuitWhitelist {
+        didSet { Preferences.syncQuitWhitelist = syncQuitWhitelist }
+    }
+
     @Published private(set) var enabled = false
     @Published private(set) var baseFolder = ""
     @Published private(set) var iCloudAvailable = false
@@ -528,8 +539,32 @@ final class MacKitCloudSyncEngine: ObservableObject {
 
 // MARK: - 设置卡片
 
+private struct SyncToggleRow: View {
+    let title: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 11))
+            Spacer(minLength: 8)
+            GlassSwitch(isOn: $isOn)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.quaternary.opacity(0.3))
+        )
+    }
+}
+
 struct MacKitSyncSettingsCard: View {
     @ObservedObject var engine: MacKitCloudSyncEngine
+
+    private func syncToggle(_ title: String, isOn: Binding<Bool>) -> some View {
+        SyncToggleRow(title: title, isOn: isOn)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -548,11 +583,27 @@ struct MacKitSyncSettingsCard: View {
             }
 
             Text(engine.enabled
-                 ? "同步快捷键、侧栏顺序和关闭白名单；文件只写入 iCloud Drive 的 MacKit 文件夹。"
-                 : "开启后通过 iCloud Drive 在你的 Mac 之间同步快捷键、侧栏顺序和关闭白名单。")
+                 ? "文件只写入 iCloud Drive 的 MacKit 文件夹；下面可选择同步哪些工具的设置。"
+                 : "开启后通过 iCloud Drive 在你的 Mac 之间同步；下面可选择同步哪些工具的设置。")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 4) {
+                syncToggle("快捷启动 · 快捷键", isOn: Binding(
+                    get: { engine.syncHotkeys },
+                    set: { engine.syncHotkeys = $0 }
+                ))
+                syncToggle("清理工具 · 关闭白名单", isOn: Binding(
+                    get: { engine.syncQuitWhitelist },
+                    set: { engine.syncQuitWhitelist = $0 }
+                ))
+                syncToggle("界面 · 侧栏顺序", isOn: Binding(
+                    get: { engine.syncSidebarOrder },
+                    set: { engine.syncSidebarOrder = $0 }
+                ))
+            }
+            .opacity(engine.enabled ? 1 : 0.55)
 
             if engine.enabled {
                 HStack(spacing: 7) {

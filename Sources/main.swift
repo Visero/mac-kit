@@ -352,6 +352,35 @@ enum Preferences {
     private static let quitWhitelistKey = "quitAllWhitelist"
 
     /// 一键关闭所有 App 时豁免的 bundle id / 路径
+    private static let syncHotkeysKey = "syncHotkeys"
+    private static let syncSidebarOrderKey = "syncSidebarOrder"
+    private static let syncQuitWhitelistKey = "syncQuitWhitelistKey"
+
+    /// 同步开关：默认全部开启，保持原有行为
+    static var syncHotkeys: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: syncHotkeysKey) == nil { return true }
+            return UserDefaults.standard.bool(forKey: syncHotkeysKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: syncHotkeysKey) }
+    }
+
+    static var syncSidebarOrder: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: syncSidebarOrderKey) == nil { return true }
+            return UserDefaults.standard.bool(forKey: syncSidebarOrderKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: syncSidebarOrderKey) }
+    }
+
+    static var syncQuitWhitelist: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: syncQuitWhitelistKey) == nil { return true }
+            return UserDefaults.standard.bool(forKey: syncQuitWhitelistKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: syncQuitWhitelistKey) }
+    }
+
     static var quitAllWhitelist: [String] {
         get { UserDefaults.standard.stringArray(forKey: quitWhitelistKey) ?? [] }
         set { UserDefaults.standard.set(newValue, forKey: quitWhitelistKey) }
@@ -3745,13 +3774,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 把同步文件夹里的设置应用到本机；不会反向标记成本机新改动。
     private func applySyncedSettings(_ record: MacKitSyncRecord) -> String? {
-        let order = normalizedSidebarOrder(record.sidebarOrder)
-        if let error = saveConfig(Config(hotkeys: record.hotkeys), notifySync: false) {
-            return error
+        let engine = model.syncEngine
+
+        if engine.syncHotkeys {
+            if let error = saveConfig(Config(hotkeys: record.hotkeys), notifySync: false) {
+                return error
+            }
         }
-        model.applySyncedPreferences(sidebarOrder: order, quitWhitelist: record.quitWhitelist)
+
+        if engine.syncSidebarOrder || engine.syncQuitWhitelist {
+            let order = engine.syncSidebarOrder ? normalizedSidebarOrder(record.sidebarOrder) : model.pageOrder
+            let whitelist = engine.syncQuitWhitelist ? record.quitWhitelist : model.quitWhitelist
+            model.applySyncedPreferences(sidebarOrder: order, quitWhitelist: whitelist)
+        }
+
         rebuildMenu()
-        Log.write("iCloud 同步：已应用远端设置（快捷键 \(record.hotkeys.count) 条）")
+        let parts = [
+            engine.syncHotkeys ? "快捷键 \(record.hotkeys.count) 条" : nil,
+            engine.syncSidebarOrder ? "侧栏顺序" : nil,
+            engine.syncQuitWhitelist ? "关闭白名单" : nil
+        ].compactMap { $0 }
+        Log.write("iCloud 同步：已应用远端设置（\(parts.isEmpty ? "全部关闭" : parts.joined(separator: "、"))）")
         return nil
     }
 

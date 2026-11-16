@@ -1187,7 +1187,6 @@ enum SettingsPage: String, CaseIterable, Identifiable {
     case menuBar
     case clipboard
     case scroll
-    case permissions
     case sync
     case settings
 
@@ -1200,7 +1199,6 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .menuBar: return "状态栏隐藏"
         case .clipboard: return "剪贴板"
         case .scroll: return "滚动反转"
-        case .permissions: return "权限"
         case .sync: return "同步与更新"
         case .settings: return "设置"
         }
@@ -1213,7 +1211,6 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .menuBar: return "menubar.rectangle"
         case .clipboard: return "doc.on.clipboard"
         case .scroll: return "arrow.up.arrow.down"
-        case .permissions: return "lock.shield"
         case .sync: return "arrow.triangle.2.circlepath"
         case .settings: return "gearshape"
         }
@@ -1397,7 +1394,6 @@ struct SettingsView: View {
                 case .menuBar: menuBarPage
                 case .clipboard: EmptyView()
                 case .scroll: ScrollSettingsPage(engine: model.scrollReversal)
-                case .permissions: permissionsPage
                 case .sync: syncPage
                 case .settings: appSettingsPage
                 }
@@ -1537,8 +1533,33 @@ struct SettingsView: View {
             sectionLabel("全局")
             settingsRows
 
+            sectionLabel("权限")
+            permissionsSection
+
             sectionLabel("配置与日志")
             configurationActions
+        }
+        .onAppear { model.refreshPermissions() }
+    }
+
+    private var permissionsSection: some View {
+        VStack(spacing: 6) {
+            ForEach(model.permissions) { item in
+                permissionRow(item)
+            }
+            HStack {
+                Button {
+                    model.refreshPermissions()
+                } label: {
+                    Label("重新检查", systemImage: "arrow.clockwise")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.bordered)
+                Spacer()
+                Text("改动权限后重启 MacKit")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
         }
     }
 
@@ -1687,29 +1708,6 @@ struct SettingsView: View {
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
         }
-    }
-
-    @ViewBuilder
-    private var permissionsPage: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            sectionLabel("系统授权")
-            VStack(spacing: 6) {
-                ForEach(model.permissions) { item in
-                    permissionRow(item)
-                }
-            }
-            HStack {
-                Button {
-                    model.refreshPermissions()
-                } label: {
-                    Label("重新检查", systemImage: "arrow.clockwise")
-                        .font(.system(size: 12))
-                }
-                .buttonStyle(.bordered)
-                Spacer()
-            }
-        }
-        .onAppear { model.refreshPermissions() }
     }
 
     private func permissionRow(_ item: MacKitModel.PermissionItem) -> some View {
@@ -1968,7 +1966,6 @@ struct SettingsView: View {
     private var footerText: String {
         switch page {
         case .tools: return toolsFooterText
-        case .permissions: return "改动权限后重启 MacKit 才会完全生效"
         case .sync: return "同步与更新设置"
         case .settings: return "修改即时生效"
         case .launcher: return model.status

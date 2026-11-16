@@ -2707,6 +2707,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var entryIDsByHotKey: [UInt32: String] = [:]
     private var clipboardPanel: ClipboardPanelController?
     private var settingsWindow: SettingsWindowController?
+    private var closeKeyMonitor: Any?
     private var shortcutBatchEditor: ShortcutBatchEditor?
     private let model = MacKitModel()
     private var config = Config(hotkeys: [])
@@ -2744,6 +2745,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyPresentation()
         loadConfig()
         rebuildMenu()
+        setupMainMenu()
+        installCloseKeyMonitor()
         scheduleUpdateChecks()
         model.syncEngine.startIfEnabled()
 
@@ -3530,6 +3533,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quitItem.target = target
         menu.addItem(quitItem)
         return menu
+    }
+
+    /// LSUIElement 应用默认没有主菜单，⌘W 没有可触发的菜单项
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appItem = NSMenuItem()
+        mainMenu.addItem(appItem)
+        let appMenu = NSMenu()
+        appItem.submenu = appMenu
+        appMenu.addItem(withTitle: "偏好设置…", action: #selector(openSettings), keyEquivalent: ",")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "退出 MacKit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+
+        let windowItem = NSMenuItem()
+        windowItem.title = "窗口"
+        mainMenu.addItem(windowItem)
+        let windowMenu = NSMenu(title: "窗口")
+        windowItem.submenu = windowMenu
+        windowMenu.addItem(withTitle: "关闭", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+
+        NSApp.mainMenu = mainMenu
+        NSApp.windowsMenu = windowMenu
+    }
+
+    /// 兜底：菜单不参与分发时也能用 ⌘W 关掉设置窗口
+    private func installCloseKeyMonitor() {
+        closeKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self else { return event }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard flags == .command,
+                  event.charactersIgnoringModifiers?.lowercased() == "w",
+                  let window = self.settingsWindow?.window,
+                  window.isKeyWindow else { return event }
+            Log.write("⌘W 关闭设置窗口")
+            window.performClose(nil)
+            return nil
+        }
     }
 
     @objc private func openSettings() {

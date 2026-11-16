@@ -729,6 +729,240 @@ final class MacKitModel: ObservableObject {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
+    // 卸载 App 与残留
+    struct InstalledApp: Identifiable, Hashable {
+        let id: String
+        let name: String
+        let path: String
+    }
+
+    struct ResidueItem: Identifiable, Hashable {
+        let id: String
+        let label: String
+        let path: String
+        let sizeBytes: Int64
+        let isAppBundle: Bool
+        var sizeText: String {
+            ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+        }
+    }
+
+    @Published var installedApps: [InstalledApp] = []
+    @Published var uninstallTargetID: String?
+    @Published var residueItems: [ResidueItem] = []
+    @Published var residueExcluded: Set<String> = []
+    @Published var uninstallStatus: String = ""
+    @Published var showUninstallConfirm = false
+
+    var onUninstallChanged: () -> Void = {}
+
+    private static let ownBundleID = Bundle.main.bundleIdentifier ?? ""
+
+    func refreshInstalledApps() {
+        let fm = FileManager.default
+        let dirs = ["/Applications", NSHomeDirectory() + "/Applications"]
+        var apps: [InstalledApp] = []
+        for dir in dirs {
+            guard let items = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for name in items where name.hasSuffix(".app") {
+                let path = dir + "/" + name
+                guard let bundle = Bundle(path: path), let id = bundle.bundleIdentifier else { continue }
+                if id.hasPrefix("com.apple.") || id == Self.ownBundleID { continue }
+                apps.append(InstalledApp(id: id, name: (name as NSString).deletingPathExtension, path: path))
+            }
+        }
+        var seen = Set<String>()
+        installedApps = apps
+            .filter { seen.insert($0.id).inserted }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        if uninstallTargetID == nil || !installedApps.contains(where: { $0.id == uninstallTargetID }) {
+            uninstallTargetID = installedApps.first?.id
+        }
+    }
+
+    private func directorySize(_ url: URL) -> Int64 {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return 0 }
+        guard isDir.boolValue else {
+            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+            return (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        }
+        var total: Int64 = 0
+        let keys: [URLResourceKey] = [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey]
+        if let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: keys) {
+            for case let fileURL as URL in enumerator {
+                guard let values = try? fileURL.resourceValues(forKeys: Set(keys)),
+                      values.isRegularFile == true else { continue }
+                total += Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
+            }
+        }
+        return total
+    }
+
+    func scanResidue() {
+        guard let id = uninstallTargetID,
+              let app = installedApps.first(where: { $0.id == id }) else { return }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let lib = home.appendingPathComponent("Library", isDirectory: true)
+        let bundle = app.id
+        let name = app.name
+
+        var urls: [URL] = [URL(fileURLWithPath: app.path)]
+        func add(_ component: String) {
+            urls.append(lib.appendingPathComponent(component))
+        }
+        add("Application Support/\(bundle)")
+        add("Application Support/\(name)")
+        add("Caches/\(bundle)")
+        add("Caches/\(name)")
+        add("Preferences/\(bundle).plist")
+        add("Logs/\(name)")
+        add("Logs/\(bundle)")
+        add("Saved Application State/\(bundle).savedState")
+        add("WebKit/\(bundle)")
+        add("HTTPStorages/\(bundle)")
+        add("LaunchAgents/\(bundle).plist")
+        add("Containers/\(bundle)")
+
+        // 组容器里按 bundle id 片段匹配
+        let groups = lib.appendingPathComponent("Group Containers", isDirectory: true)
+        if let items = try? FileManager.default.contentsOfDirectory(at: groups, includingPropertiesForKeys: nil) {
+            let needle = bundle.lowercased()
+            for item in items where item.lastPathComponent.lowercased().contains(needle) {
+                urls.append(item)
+            }
+        }
+
+        var seen = Set<String>()
+        residueItems = urls
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+            .filter { seen.insert($0.path).inserted }
+            .map { url in
+                ResidueItem(
+                    id: url.path,
+                    label: label(for: url, home: home, app: app),
+                    path: url.path,
+                    sizeBytes: directorySize(url),
+                    isAppBundle: url.path == app.path
+                )
+            }
+            .sorted { $0.isAppBundle && !$1.isAppBundle }
+        residueExcluded = []
+        uninstallStatus = residueItems.isEmpty ? "没有找到残留文件" : "找到 \(residueItems.count) 项，可取消勾选后清理"
+    }
+
+    private func label(for url: URL, home: URL, app: InstalledApp) -> String {
+        if url.path == app.path { return "应用本体" }
+        let rel = url.path.replacingOccurrences(of: home.path + "/Library/", with: "")
+        return rel.isEmpty ? url.lastPathComponent : rel
+    }
+
+    func toggleResidue(_ path: String) {
+        if residueExcluded.contains(path) {
+            residueExcluded.remove(path)
+        } else {
+            residueExcluded.insert(path)
+        }
+    }
+
+    func isResidueSelected(_ path: String) -> Bool {
+        !residueExcluded.contains(path)
+    }
+
+    var residueSelectedSize: Int64 {
+        residueItems.filter { isResidueSelected($0.path) }.reduce(0) { $0 + $1.sizeBytes }
+    }
+
+    func trashResidue() {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser.path
+        let selected = residueItems.filter { isResidueSelected($0.path) }
+        guard !selected.isEmpty else {
+            uninstallStatus = "先勾选要清理的项"
+            return
+        }
+        var done = 0
+        var failed: [String] = []
+        for item in selected {
+            // 只允许动 App 本体或 ~/Library 下的东西
+            let allowed = item.isAppBundle || item.path.hasPrefix(home + "/Library/") || item.path.hasPrefix("/Applications/")
+            guard allowed else {
+                failed.append(item.label)
+                continue
+            }
+            do {
+                try fm.trashItem(at: URL(fileURLWithPath: item.path), resultingItemURL: nil)
+                done += 1
+            } catch {
+                failed.append(item.label)
+            }
+        }
+        uninstallStatus = failed.isEmpty
+            ? "已把 \(done) 项移到废纸篓"
+            : "已清理 \(done) 项，\(failed.count) 项失败：\(failed.prefix(3).joined(separator: "、"))"
+        residueItems.removeAll { item in
+            !fm.fileExists(atPath: item.path)
+        }
+        residueExcluded = []
+        onUninstallChanged()
+    }
+
+    // 权限体检
+    struct PermissionItem: Identifiable {
+        let id: String
+        let title: String
+        let detail: String
+        let granted: Bool
+        let pane: String?
+        var onText: String = "已授权"
+        var offText: String = "未授权"
+    }
+
+    @Published var permissions: [PermissionItem] = []
+    var onOpenPermissionPane: (String) -> Void = { _ in }
+
+    private static func hasFullDiskAccess() -> Bool {
+        let safari = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Safari")
+        return (try? FileManager.default.contentsOfDirectory(at: safari, includingPropertiesForKeys: nil)) != nil
+    }
+
+    func refreshPermissions() {
+        permissions = [
+            PermissionItem(
+                id: "ax",
+                title: "辅助功能",
+                detail: "滚动反转、选中后自动粘贴、菜单栏隐藏",
+                granted: AXIsProcessTrusted(),
+                pane: "Privacy_Accessibility"
+            ),
+            PermissionItem(
+                id: "fda",
+                title: "完全磁盘访问权限",
+                detail: "清理 Safari 历史、最近使用记录与 App 残留",
+                granted: Self.hasFullDiskAccess(),
+                pane: "Privacy_AllFiles"
+            ),
+            PermissionItem(
+                id: "engine",
+                title: "菜单栏隐藏引擎",
+                detail: NativeVisibility.isAvailable ? "系统白名单（macOS 27 及以上）可用" : "旧系统：撑宽分隔条方案",
+                granted: NativeVisibility.isAvailable,
+                pane: nil,
+                onText: "可用",
+                offText: "不可用"
+            ),
+            PermissionItem(
+                id: "login",
+                title: "开机自启",
+                detail: LoginAgent.isEnabled ? "已安装 LaunchAgent" : "未安装 LaunchAgent",
+                granted: LoginAgent.isEnabled,
+                pane: nil,
+                onText: "已开启",
+                offText: "未开启"
+            )
+        ]
+    }
+
     // 一键关闭所有 App：普通前台 App + 白名单豁免
     struct QuitApp: Identifiable, Hashable {
         let id: String
@@ -953,28 +1187,31 @@ enum SettingsPage: String, CaseIterable, Identifiable {
     case menuBar
     case clipboard
     case scroll
+    case permissions
     case settings
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .tools: return "常用工具"
+        case .tools: return "清理工具"
         case .launcher: return "快捷启动"
         case .menuBar: return "状态栏隐藏"
         case .clipboard: return "剪贴板"
         case .scroll: return "滚动反转"
+        case .permissions: return "权限"
         case .settings: return "基础设置"
         }
     }
 
     var symbol: String {
         switch self {
-        case .tools: return "wand.and.stars"
+        case .tools: return "trash"
         case .launcher: return "command"
         case .menuBar: return "menubar.rectangle"
         case .clipboard: return "doc.on.clipboard"
         case .scroll: return "arrow.up.arrow.down"
+        case .permissions: return "lock.shield"
         case .settings: return "gearshape"
         }
     }
@@ -983,6 +1220,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
 final class SettingsViewState: ObservableObject {
     @Published var showAddShortcut = false
     @Published var showQuitWhitelist = false
+    @Published var showUninstall = false
 }
 
 struct SettingsView: View {
@@ -1010,6 +1248,11 @@ struct SettingsView: View {
                     viewState.showAddShortcut = false
                 }
             )
+        }
+        .sheet(isPresented: $viewState.showUninstall) {
+            UninstallView(model: model) {
+                viewState.showUninstall = false
+            }
         }
         .sheet(isPresented: $viewState.showQuitWhitelist) {
             QuitWhitelistView(model: model) {
@@ -1151,6 +1394,7 @@ struct SettingsView: View {
                 case .menuBar: menuBarPage
                 case .clipboard: EmptyView()
                 case .scroll: ScrollSettingsPage(engine: model.scrollReversal)
+                case .permissions: permissionsPage
                 case .settings: appSettingsPage
                 }
                 Spacer(minLength: 0)
@@ -1437,6 +1681,58 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private var permissionsPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            sectionLabel("系统授权")
+            VStack(spacing: 6) {
+                ForEach(model.permissions) { item in
+                    permissionRow(item)
+                }
+            }
+            HStack {
+                Button {
+                    model.refreshPermissions()
+                } label: {
+                    Label("重新检查", systemImage: "arrow.clockwise")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.bordered)
+                Spacer()
+            }
+        }
+        .onAppear { model.refreshPermissions() }
+    }
+
+    private func permissionRow(_ item: MacKitModel.PermissionItem) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: item.granted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(item.granted ? Color.green : Color.orange)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(item.title)
+                    .font(.system(size: 13))
+                Text(item.detail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 8)
+            Text(item.granted ? item.onText : item.offText)
+                .font(.system(size: 11))
+                .foregroundStyle(item.granted ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
+            if let pane = item.pane, !item.granted {
+                Button("去授权") { model.onOpenPermissionPane(pane) }
+                    .font(.system(size: 11))
+                    .buttonStyle(.bordered)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(.quaternary.opacity(0.4))
+        )
+    }
+
     private var toolsPage: some View {
         VStack(alignment: .leading, spacing: 14) {
             sectionLabel("清理记录")
@@ -1506,6 +1802,9 @@ struct SettingsView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
 
+            sectionLabel("卸载 App")
+            uninstallCard
+
             sectionLabel("批量关闭")
             quitAllCard
                 .alert("关闭所有 App？", isPresented: $model.showQuitAllConfirm) {
@@ -1521,6 +1820,33 @@ struct SettingsView: View {
         } message: {
             Text("清空浏览记录前需要先退出 Safari，否则运行中的记录会被写回。")
         }
+    }
+
+    private var uninstallCard: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("卸载 App 与残留")
+                    .font(.system(size: 13))
+                Text("按 bundle id 扫描 ~/Library 里的配置、缓存、日志与自启项，先勾选再清理")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 8)
+            Button {
+                model.refreshInstalledApps()
+                viewState.showUninstall = true
+            } label: {
+                Label("选择 App…", systemImage: "trash.slash")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .fill(.quaternary.opacity(0.4))
+        )
     }
 
     private var historyRangeRow: some View {
@@ -1633,6 +1959,7 @@ struct SettingsView: View {
     private var footerText: String {
         switch page {
         case .tools: return toolsFooterText
+        case .permissions: return "改动权限后重启 MacKit 才会完全生效"
         case .settings: return "修改即时生效"
         case .launcher: return model.status
         case .menuBar: return "点箭头即可折叠 / 展开"
@@ -2215,6 +2542,155 @@ func runShortcutRecorderCheck() -> Never {
     require(captured.last?.0 == "" && !recorder.recording, "退格清除")
     print("✓ 录制框全区域命中、其它按钮不被遮挡、点击聚焦、组合键录入、失焦隔离、Esc 取消和退格清除通过")
     exit(0)
+}
+
+struct UninstallView: View {
+    @ObservedObject var model: MacKitModel
+    var onClose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("卸载 App 与残留")
+                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                Spacer()
+                Button("关闭") { onClose() }
+                    .buttonStyle(.bordered)
+            }
+
+            HStack(alignment: .top, spacing: 12) {
+                appColumn
+                residueColumn
+            }
+
+            HStack(spacing: 8) {
+                Text(model.uninstallStatus)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Spacer()
+                Button {
+                    model.scanResidue()
+                } label: {
+                    Label("重新扫描", systemImage: "arrow.clockwise")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.uninstallTargetID == nil)
+
+                Button {
+                    model.showUninstallConfirm = true
+                } label: {
+                    Label("移到废纸篓", systemImage: "trash")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .disabled(model.residueItems.isEmpty)
+            }
+        }
+        .padding(18)
+        .frame(width: 640, height: 470)
+        .alert("移到废纸篓？", isPresented: $model.showUninstallConfirm) {
+            Button("移到废纸篓", role: .destructive) { model.trashResidue() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将把勾选的 \(model.residueItems.filter { model.isResidueSelected($0.path) }.count) 项移到废纸篓，包括应用本体。可在废纸篓里恢复。")
+        }
+        .onAppear {
+            model.refreshInstalledApps()
+            if let id = model.uninstallTargetID, model.residueItems.isEmpty,
+               model.installedApps.contains(where: { $0.id == id }) {
+                model.scanResidue()
+            }
+        }
+    }
+
+    private var appColumn: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("已安装 App")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            ScrollView {
+                VStack(spacing: 2) {
+                    ForEach(model.installedApps) { app in
+                        let selected = model.uninstallTargetID == app.id
+                        Button {
+                            model.uninstallTargetID = app.id
+                            model.scanResidue()
+                        } label: {
+                            HStack {
+                                Text(app.name)
+                                    .font(.system(size: 12))
+                                    .lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .fill(selected ? AnyShapeStyle(Color.primary.opacity(0.14)) : AnyShapeStyle(Color.clear))
+                            )
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .frame(width: 220, height: 340)
+        }
+    }
+
+    private var residueColumn: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("将清理")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(ByteCountFormatter.string(fromByteCount: model.residueSelectedSize, countStyle: .file))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            ScrollView {
+                VStack(spacing: 2) {
+                    if model.residueItems.isEmpty {
+                        Text("选择左侧 App 后自动扫描")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    }
+                    ForEach(model.residueItems) { item in
+                        Button {
+                            model.toggleResidue(item.path)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: model.isResidueSelected(item.path) ? "checkmark.square.fill" : "square")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(model.isResidueSelected(item.path) ? Color.accentColor : Color.secondary)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(item.label)
+                                        .font(.system(size: 11))
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Text(item.sizeText)
+                                        .font(.system(size: 9))
+                                        .foregroundStyle(.tertiary)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .frame(width: 360, height: 340)
+        }
+    }
 }
 
 /// 自绘开关：胶囊底 + 圆形滑块，跟着系统强调色走，未开启时是半透明灰
@@ -2866,6 +3342,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onToggleMenuBarToggleVisible = { [weak self] in self?.toggleMenuBarToggleItem() }
         model.onToggleMenuBarSeparatorVisible = { [weak self] in self?.toggleMenuBarSeparatorItem() }
         model.onToggleKeepApp = { [weak self] bundleID in self?.toggleHiddenApp(bundleID) }
+        model.onOpenPermissionPane = { [weak self] pane in
+            self?.openPrivacyPane(pane)
+        }
     }
 
     // MARK: 菜单栏图标折叠
@@ -3574,6 +4053,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func openPrivacyPane(_ pane: String) {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     @objc private func openSettings() {
         if settingsWindow == nil {
             let controller = SettingsWindowController(model: model)
@@ -3734,6 +4218,27 @@ func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
 
     if page == .clipboard && !demo { model.clipboard.start() }
     model.page = page
+    if CommandLine.arguments.contains("--uninstall") {
+        model.refreshInstalledApps()
+        if let first = model.installedApps.first(where: { $0.name == "mimi" }) ?? model.installedApps.first {
+            model.uninstallTargetID = first.id
+            model.scanResidue()
+        }
+        let sheet = UninstallView(model: model, onClose: {})
+            .background(Color(red: 0.16, green: 0.18, blue: 0.22))
+            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        let renderer = ImageRenderer(content: sheet)
+        renderer.scale = 2
+        if let image = renderer.nsImage,
+           let tiff = image.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            try? png.write(to: URL(fileURLWithPath: path))
+            print("saved \(path)")
+        }
+        exit(0)
+    }
+
     let view = SettingsView(model: model)
         .background(
             LinearGradient(
@@ -3827,6 +4332,27 @@ func runVisibilityTest() -> Never {
     while !done {
         RunLoop.current.run(until: Date().addingTimeInterval(0.1))
     }
+    exit(0)
+}
+
+// MARK: - 残留扫描自检（--scan-residue <bundle id|名称>，只扫描不删除）
+
+func runResidueScan(_ target: String) -> Never {
+    let model = MacKitModel()
+    model.refreshInstalledApps()
+    guard let app = model.installedApps.first(where: { $0.id == target || $0.name == target }) else {
+        print("未找到 App: \(target)")
+        print("可选: " + model.installedApps.map { "\($0.name)(\($0.id))" }.prefix(20).joined(separator: "、"))
+        exit(1)
+    }
+    model.uninstallTargetID = app.id
+    model.scanResidue()
+    print("\(app.name)  \(app.id)")
+    for item in model.residueItems {
+        print("  \(item.sizeText)\t\(item.label)")
+    }
+    let total = model.residueItems.reduce(Int64(0)) { $0 + $1.sizeBytes }
+    print("合计 \(ByteCountFormatter.string(fromByteCount: total, countStyle: .file))，\(model.residueItems.count) 项")
     exit(0)
 }
 
@@ -3966,6 +4492,9 @@ if CommandLine.arguments.contains("--range-test") {
 }
 
 if CommandLine.arguments.contains("--visibility-test") { runVisibilityTest() }
+if let index = CommandLine.arguments.firstIndex(of: "--scan-residue"), CommandLine.arguments.count > index + 1 {
+    runResidueScan(CommandLine.arguments[index + 1])
+}
 if CommandLine.arguments.contains("--version") { runVersionCheck() }
 if CommandLine.arguments.contains("--update-check") { runUpdateCheck() }
 if CommandLine.arguments.contains("--update-fixture") { runUpdateFixtureTest() }

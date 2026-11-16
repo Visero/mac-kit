@@ -4388,6 +4388,77 @@ func runVisibilityTest() -> Never {
     exit(0)
 }
 
+// MARK: - 图片 OCR 自检（--ocr-test <png>）
+
+func runOCRTest(_ path: String) -> Never {
+    guard let image = NSImage(contentsOfFile: path) else {
+        print("读不到图片: \(path)")
+        exit(1)
+    }
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+        let started = Date()
+        let text = await ImageOCR.recognize(image)
+        let elapsed = String(format: "%.2f", Date().timeIntervalSince(started))
+        if let text {
+            print("识别到 \(text.count) 个字符，用时 \(elapsed)s")
+            print(text)
+        } else {
+            print("没有识别到文字，用时 \(elapsed)s")
+        }
+        semaphore.signal()
+    }
+    _ = semaphore.wait(timeout: .now() + 30)
+    exit(0)
+}
+
+// MARK: - 图片 OCR + 翻译自检（--ocr-translate-test <png>）
+
+@available(macOS 15.0, *)
+func runOCRTranslateTest(_ path: String) -> Never {
+    guard let image = NSImage(contentsOfFile: path) else {
+        print("读不到图片: \(path)")
+        exit(1)
+    }
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+        guard let text = await ImageOCR.recognize(image) else {
+            print("没有识别到文字")
+            semaphore.signal()
+            return
+        }
+        print("原文（\(text.count) 字）：\n\(text)")
+        AppleTranslationService.shared.translate(text) { translated in
+            if let translated {
+                print("译文：\n\(translated)")
+            } else {
+                print("翻译失败（可能缺少语言包）")
+            }
+            semaphore.signal()
+        }
+    }
+    // 需要跑 RunLoop，SwiftUI 的 translationTask 才会开始
+    let deadline = Date().addingTimeInterval(45)
+    while Date() < deadline {
+        if semaphore.wait(timeout: .now() + 0.1) == .success { break }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+    }
+    exit(0)
+}
+
+// MARK: - OCR 结果窗口自检（--ocr-window-test <png>，会短暂弹出结果窗口）
+
+func runOCRWindowTest(_ path: String) -> Never {
+    guard let image = NSImage(contentsOfFile: path) else {
+        print("读不到图片: \(path)")
+        exit(1)
+    }
+    _ = NSApplication.shared
+    OCRResultWindowController.shared.show(image: image, translate: true)
+    RunLoop.main.run(until: Date().addingTimeInterval(25))
+    exit(0)
+}
+
 // MARK: - 残留扫描自检（--scan-residue <bundle id|名称>，只扫描不删除）
 
 func runResidueScan(_ target: String) -> Never {
@@ -4545,6 +4616,16 @@ if CommandLine.arguments.contains("--range-test") {
 }
 
 if CommandLine.arguments.contains("--visibility-test") { runVisibilityTest() }
+if let index = CommandLine.arguments.firstIndex(of: "--ocr-translate-test"), CommandLine.arguments.count > index + 1 {
+    if #available(macOS 15.0, *) { runOCRTranslateTest(CommandLine.arguments[index + 1]) }
+    exit(0)
+}
+if let index = CommandLine.arguments.firstIndex(of: "--ocr-window-test"), CommandLine.arguments.count > index + 1 {
+    runOCRWindowTest(CommandLine.arguments[index + 1])
+}
+if let index = CommandLine.arguments.firstIndex(of: "--ocr-test"), CommandLine.arguments.count > index + 1 {
+    runOCRTest(CommandLine.arguments[index + 1])
+}
 if let index = CommandLine.arguments.firstIndex(of: "--scan-residue"), CommandLine.arguments.count > index + 1 {
     runResidueScan(CommandLine.arguments[index + 1])
 }

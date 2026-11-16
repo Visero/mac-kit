@@ -24,9 +24,10 @@ clang -c -fobjc-arc -O2 \
 swiftc -O -swift-version 5 \
     -target "$(uname -m)-apple-macos13.0" \
     -import-objc-header Sources/native_visibility.h \
-    -framework Cocoa -framework Carbon -framework ServiceManagement -framework IOKit \
+    -framework Cocoa -framework Carbon -framework ServiceManagement -framework IOKit -framework Vision \
+    -Xlinker -weak_framework -Xlinker Translation \
     -o "$BUNDLE/Contents/MacOS/$APP_NAME" \
-    Sources/main.swift Sources/MenuBarIcon.swift Sources/CloudSync.swift Sources/ShortcutBatchEditor.swift Sources/ClipboardHistory.swift Sources/ClipboardUI.swift Sources/ScrollReversal.swift "$BUILD_DIR/native_visibility.o" "$BUILD_DIR/scroll_device.o"
+    Sources/main.swift Sources/MenuBarIcon.swift Sources/CloudSync.swift Sources/ShortcutBatchEditor.swift Sources/ClipboardHistory.swift Sources/ClipboardUI.swift Sources/ScrollReversal.swift Sources/ImageOCR.swift Sources/OCRWindow.swift "$BUILD_DIR/native_visibility.o" "$BUILD_DIR/scroll_device.o"
 
 echo "==> 打包"
 cp Info.plist "$BUNDLE/Contents/Info.plist"

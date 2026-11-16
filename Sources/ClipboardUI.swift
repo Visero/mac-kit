@@ -105,6 +105,9 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         menu.addItem(withTitle: "复制", action: #selector(copySelection), keyEquivalent: "")
         menu.addItem(withTitle: "置顶 / 取消置顶", action: #selector(pinSelection), keyEquivalent: "")
         menu.addItem(.separator())
+        menu.addItem(withTitle: "提取文字（OCR）", action: #selector(ocrSelection), keyEquivalent: "")
+        menu.addItem(withTitle: "提取文字并翻译", action: #selector(ocrTranslateSelection), keyEquivalent: "")
+        menu.addItem(.separator())
         menu.addItem(withTitle: "指定快捷键…", action: #selector(assignShortcut), keyEquivalent: "")
         menu.addItem(withTitle: "清除快捷键", action: #selector(clearShortcut), keyEquivalent: "")
         menu.addItem(.separator())
@@ -670,11 +673,25 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         let entry = selectedEntry
         for item in menu.items {
             switch item.title {
+            case "提取文字（OCR）", "提取文字并翻译": item.isEnabled = entry?.kind == .image
             case "清除快捷键": item.isEnabled = entry?.shortcutLabel != nil
             case "指定快捷键…": item.isEnabled = entry != nil
             default: item.isEnabled = entry != nil
             }
         }
+    }
+
+    @objc private func ocrSelection() {
+        runOCR(translate: false)
+    }
+
+    @objc private func ocrTranslateSelection() {
+        runOCR(translate: true)
+    }
+
+    private func runOCR(translate: Bool) {
+        guard let entry = selectedEntry, let image = entry.image else { return }
+        OCRResultWindowController.shared.show(image: image, translate: translate)
     }
 
     @objc private func assignShortcut() {

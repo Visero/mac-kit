@@ -1188,6 +1188,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
     case clipboard
     case scroll
     case permissions
+    case sync
     case settings
 
     var id: String { rawValue }
@@ -1200,7 +1201,8 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .clipboard: return "剪贴板"
         case .scroll: return "滚动反转"
         case .permissions: return "权限"
-        case .settings: return "基础设置"
+        case .sync: return "同步与更新"
+        case .settings: return "设置"
         }
     }
 
@@ -1212,6 +1214,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .clipboard: return "doc.on.clipboard"
         case .scroll: return "arrow.up.arrow.down"
         case .permissions: return "lock.shield"
+        case .sync: return "arrow.triangle.2.circlepath"
         case .settings: return "gearshape"
         }
     }
@@ -1319,7 +1322,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text("MacKit")
                     .font(.system(size: 13, weight: .semibold, design: .rounded))
-                Text("快捷键启动器")
+                Text("菜单栏效率工具集")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
@@ -1395,6 +1398,7 @@ struct SettingsView: View {
                 case .clipboard: EmptyView()
                 case .scroll: ScrollSettingsPage(engine: model.scrollReversal)
                 case .permissions: permissionsPage
+                case .sync: syncPage
                 case .settings: appSettingsPage
                 }
                 Spacer(minLength: 0)
@@ -1529,18 +1533,23 @@ struct SettingsView: View {
     }
 
     private var appSettingsPage: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            sectionLabel("应用")
+        VStack(alignment: .leading, spacing: 14) {
+            sectionLabel("全局")
             settingsRows
-
-            sectionLabel("同步")
-            MacKitSyncSettingsCard(engine: model.syncEngine)
-
-            sectionLabel("关于")
-            updateRows
 
             sectionLabel("配置与日志")
             configurationActions
+        }
+    }
+
+    @ViewBuilder
+    private var syncPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            sectionLabel("同步")
+            MacKitSyncSettingsCard(engine: model.syncEngine)
+
+            sectionLabel("版本升级")
+            updateRows
         }
     }
 
@@ -1960,6 +1969,7 @@ struct SettingsView: View {
         switch page {
         case .tools: return toolsFooterText
         case .permissions: return "改动权限后重启 MacKit 才会完全生效"
+        case .sync: return "同步与更新设置"
         case .settings: return "修改即时生效"
         case .launcher: return model.status
         case .menuBar: return "点箭头即可折叠 / 展开"

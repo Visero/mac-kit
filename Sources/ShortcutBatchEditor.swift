@@ -73,8 +73,56 @@ enum ShortcutConfiguration {
 
 // MARK: - 原生批量编辑窗口
 
+/// 不依赖应用菜单的标准文本编辑；⌘S 继续交给窗口的保存按钮。
+private final class BatchTextView: NSTextView {
+    var editPasteboard: NSPasteboard = .general
+
+    @discardableResult
+    func handleEditingKey(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection([.command, .shift, .control, .option])
+        guard flags == [.command] || flags == [.command, .shift] else { return false }
+        switch (event.keyCode, flags.contains(.shift)) {
+        case (0, false): selectAll(nil)
+        case (8, false): copy(nil)
+        case (7, false): cut(nil)
+        case (9, _): paste(nil)
+        case (6, false): undoManager?.undo()
+        case (6, true): undoManager?.redo()
+        default: return false
+        }
+        return true
+    }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard window?.firstResponder === self else { return false }
+        return handleEditingKey(event) || super.performKeyEquivalent(with: event)
+    }
+    override func keyDown(with event: NSEvent) {
+        if !handleEditingKey(event) { super.keyDown(with: event) }
+    }
+    override func copy(_ sender: Any?) {
+        let range = selectedRange()
+        guard range.length > 0, NSMaxRange(range) <= (string as NSString).length else { return }
+        editPasteboard.clearContents()
+        editPasteboard.setString((string as NSString).substring(with: range), forType: .string)
+    }
+    override func cut(_ sender: Any?) {
+        guard isEditable, selectedRange().length > 0 else { return }
+        copy(sender)
+        insertText("", replacementRange: selectedRange())
+    }
+    override func paste(_ sender: Any?) {
+        guard isEditable else { return }
+        let text = editPasteboard.string(forType: .string)
+            ?? editPasteboard.data(forType: .rtf).flatMap { NSAttributedString(rtf: $0, documentAttributes: nil)?.string }
+        guard let text else { return }
+        insertText(text, replacementRange: selectedRange())
+    }
+    override func pasteAsPlainText(_ sender: Any?) { paste(sender) }
+}
+
 final class ShortcutBatchEditor: NSWindowController {
-    private let editor = NSTextView()
+    private let editor = BatchTextView()
+    private var editingMonitor: Any?
     private let message = NSTextField(wrappingLabelWithString: "修改完整 JSON，保存后立即生效；校验失败不会覆盖原配置。")
     private let save: (String) -> String?
 
@@ -87,12 +135,23 @@ final class ShortcutBatchEditor: NSWindowController {
         window.isReleasedWhenClosed = false
         super.init(window: window)
         setup(config)
+        editingMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, let window = self.window, window.isKeyWindow,
+                  event.window === window, window.firstResponder === self.editor else { return event }
+            return self.editor.handleEditingKey(event) ? nil : event
+        }
     }
+    deinit { if let editingMonitor { NSEvent.removeMonitor(editingMonitor) } }
     required init?(coder: NSCoder) { fatalError("init(coder:) 未实现") }
 
     private func setup(_ config: Config) {
         guard let root = window?.contentView else { return }
         editor.isRichText = false
+        editor.isEditable = true
+        editor.isSelectable = true
+        editor.allowsUndo = true
+        editor.setAccessibilityLabel("快捷键 JSON 编辑器")
+        editor.setAccessibilityIdentifier("batchShortcutEditor")
         editor.isAutomaticQuoteSubstitutionEnabled = false
         editor.isAutomaticDashSubstitutionEnabled = false
         editor.isAutomaticTextReplacementEnabled = false
@@ -161,6 +220,42 @@ final class ShortcutBatchEditor: NSWindowController {
         else { close() }
     }
     private func showError(_ text: String) { message.stringValue = text; message.textColor = .systemOrange }
+}
+
+func runBatchEditingCheck() -> Never {
+    _ = NSApplication.shared
+    let board = NSPasteboard(name: NSPasteboard.Name("MacKit-Edit-Test-\(UUID().uuidString)"))
+    defer { board.releaseGlobally() }
+    let editor = BatchTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+    editor.editPasteboard = board
+    editor.isRichText = false
+    editor.allowsUndo = true
+    let window = NSWindow(contentRect: editor.frame, styleMask: [.titled], backing: .buffered, defer: false)
+    window.contentView = editor
+    window.makeFirstResponder(editor)
+    func event(_ code: UInt16, shift: Bool = false) -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: shift ? [.command, .shift] : [.command],
+                        timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                        characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: code)!
+    }
+    func require(_ condition: Bool, _ name: String) { if !condition { print("✗ 批量编辑：" + name); exit(1) } }
+    let sample = "{\"hotkeys\":[]}\n中文测试"
+    editor.string = sample
+    require(editor.performKeyEquivalent(with: event(0)) && editor.selectedRange().length == (sample as NSString).length, "⌘A")
+    require(editor.performKeyEquivalent(with: event(8)) && board.string(forType: .string) == sample, "⌘C")
+    require(editor.performKeyEquivalent(with: event(7)) && editor.string.isEmpty, "⌘X")
+    require(editor.performKeyEquivalent(with: event(9)) && editor.string == sample, "⌘V")
+    editor.selectAll(nil)
+    board.clearContents()
+    board.setString("纯文本粘贴", forType: .string)
+    require(editor.performKeyEquivalent(with: event(9, shift: true)) && editor.string == "纯文本粘贴", "⌘⇧V")
+    require(editor.performKeyEquivalent(with: event(6)) && editor.string == sample, "⌘Z")
+    require(editor.performKeyEquivalent(with: event(6, shift: true)) && editor.string == "纯文本粘贴", "⌘⇧Z")
+    require(!editor.performKeyEquivalent(with: event(1)), "⌘S 交给保存按钮")
+    window.makeFirstResponder(nil)
+    require(!editor.performKeyEquivalent(with: event(8)), "失焦不抢快捷键")
+    print("✓ 批量编辑：全选、复制、剪切、纯文本粘贴、撤销/重做及失焦隔离通过（隔离剪贴板）")
+    exit(0)
 }
 
 func runShortcutConfigurationCheck() -> Never {

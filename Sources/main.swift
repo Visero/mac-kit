@@ -673,6 +673,7 @@ final class MacKitModel: ObservableObject {
     @Published var loginItemEnabled: Bool = false
     @Published var icon: NSImage? = NSApp.applicationIconImage
     @Published var showMenuBarIcon: Bool = Preferences.showMenuBarIcon
+    @Published var menuBarIconStyle: MenuBarIconStyle = MenuBarIconStyle.load()
     @Published var showDockIcon: Bool = Preferences.showDockIcon
 
     /// iCloud 文件夹同步；由 AppDelegate 注入读写当前配置的闭包。
@@ -931,6 +932,7 @@ final class MacKitModel: ObservableObject {
     var onQuit: () -> Void = {}
     var onCloseWindow: () -> Void = {}
     var onToggleMenuBarIcon: () -> Void = {}
+    var onSetMenuBarIcon: (MenuBarIconStyle) -> Void = { _ in }
     var onToggleDockIcon: () -> Void = {}
     var onToggleSelfHotkey: () -> Void = {}
     var onCheckUpdate: () -> Void = {}
@@ -1136,6 +1138,12 @@ struct SettingsView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .clipped()
                 .accessibilityIdentifier("clipboardSettingsScroll")
+            } else if page == .settings {
+                ScrollView(.vertical, showsIndicators: true) {
+                    appSettingsPage.padding(.trailing, 6).padding(.bottom, 8)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
             } else {
                 switch page {
                 case .tools: toolsPage
@@ -1731,6 +1739,10 @@ struct SettingsView: View {
                 get: { model.showMenuBarIcon },
                 set: { _ in model.onToggleMenuBarIcon() }
             ), verticalPadding: 6)
+            MenuBarIconPicker(selection: Binding(
+                get: { model.menuBarIconStyle },
+                set: { model.onSetMenuBarIcon($0) }
+            ))
             settingRow("显示 Dock 图标", symbol: "dock.rectangle", isOn: Binding(
                 get: { model.showDockIcon },
                 set: { _ in model.onToggleDockIcon() }
@@ -1962,6 +1974,7 @@ private struct AddShortcutView: View {
                     modifiers: $state.modifiers,
                     onChange: { state.error = "" }
                 )
+                .frame(maxWidth: .infinity).frame(height: 44)
                 Text("至少包含 ⌘、⌥ 或 ⌃ 中的一个；点击上方按键区域后直接按下组合键。")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
@@ -2022,104 +2035,186 @@ private struct AddShortcutView: View {
     }
 }
 
-private struct KeyRecorderBox: View {
+private struct KeyRecorderBox: NSViewRepresentable {
     @Binding var key: String
     @Binding var modifiers: [String]
     var onChange: () -> Void
 
-    private var label: String {
-        guard !key.isEmpty else { return "" }
-        return "\(KeyCodes.display(modifiers))\(KeyCodes.keyLabel(key))"
-    }
-
-    var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(.quaternary.opacity(0.55))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
-                )
-
-            HStack(spacing: 8) {
-                if key.isEmpty {
-                    Text("点击后按下组合键…")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(label)
-                        .font(.system(size: 15, weight: .semibold, design: .rounded))
-                }
-                Spacer(minLength: 0)
-                Image(systemName: "keyboard")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(.horizontal, 12)
-
-            KeyCaptureRepresentable { newKey, newModifiers in
-                key = newKey
-                modifiers = newModifiers
-                onChange()
-            }
-        }
-        .frame(height: 44)
-    }
-}
-
-private struct KeyCaptureRepresentable: NSViewRepresentable {
-    var onCapture: (String, [String]) -> Void
-
-    func makeNSView(context: Context) -> KeyCaptureNSView {
-        let view = KeyCaptureNSView()
-        view.onCapture = onCapture
+    func makeNSView(context: Context) -> ShortcutRecorderControl {
+        let view = ShortcutRecorderControl()
+        updateNSView(view, context: context)
         return view
     }
 
-    func updateNSView(_ nsView: KeyCaptureNSView, context: Context) {
-        nsView.onCapture = onCapture
+    func updateNSView(_ view: ShortcutRecorderControl, context: Context) {
+        view.recordedKey = key
+        view.recordedModifiers = modifiers
+        view.onCapture = { newKey, newModifiers in
+            key = newKey
+            modifiers = newModifiers
+            onChange()
+        }
     }
 }
 
-private final class KeyCaptureNSView: NSView {
+/// 一个原生控件同时负责绘制、命中和焦点，不再用透明 SwiftUI 覆盖层。
+private final class ShortcutRecorderControl: NSControl {
+    var recordedKey = "" { didSet { needsDisplay = true } }
+    var recordedModifiers: [String] = [] { didSet { needsDisplay = true } }
     var onCapture: ((String, [String]) -> Void)?
+    private var monitor: Any?
+    private(set) var recording = false
+    private var hint = ""
 
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("录制快捷键")
+        setAccessibilityIdentifier("shortcutRecorder")
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) 未实现") }
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 44) }
     override var acceptsFirstResponder: Bool { true }
-
-    override func becomeFirstResponder() -> Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self, let window = self.window else { return }
-            window.makeFirstResponder(self)
+        if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
+        guard window != nil else { return }
+        // ⌘ 组合要在菜单/默认按钮处理前收下，只限当前录制框聚焦时。
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.recording, let window = self.window,
+                  window.isKeyWindow, event.window === window,
+                  window.firstResponder === self else { return event }
+            self.keyDown(with: event)
+            return nil
         }
     }
+    deinit { if let monitor { NSEvent.removeMonitor(monitor) } }
 
-    override func hitTest(_ point: NSPoint) -> NSView? { self }
-
-    override func mouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self)
+    override func becomeFirstResponder() -> Bool {
+        recording = true
+        hint = ""
+        needsDisplay = true
+        return true
     }
-
+    override func resignFirstResponder() -> Bool {
+        recording = false
+        hint = ""
+        needsDisplay = true
+        return true
+    }
+    override func mouseDown(with event: NSEvent) { _ = startRecording() }
+    @discardableResult
+    func startRecording() -> Bool {
+        guard isEnabled, let window else { return false }
+        window.makeKey()
+        return window.makeFirstResponder(self)
+    }
+    override func accessibilityPerformPress() -> Bool { startRecording() }
+    override func accessibilityValue() -> Any? {
+        recording ? "正在录制，请按下组合键" : (recordedKey.isEmpty ? "未设置" : KeyCodes.display(recordedModifiers) + KeyCodes.keyLabel(recordedKey))
+    }
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard recording, window?.firstResponder === self else { return false }
         keyDown(with: event)
         return true
     }
-
     override func keyDown(with event: NSEvent) {
-        guard let key = KeyCodes.name(for: event.keyCode) else {
-            NSSound.beep()
+        guard recording else { return }
+        let flags = event.modifierFlags.intersection([.control, .option, .command, .shift])
+        if event.keyCode == 53 && flags.isEmpty {
+            window?.makeFirstResponder(nil)
             return
         }
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if event.keyCode == 51 && flags.isEmpty {
+            recordedKey = ""
+            recordedModifiers = []
+            onCapture?("", [])
+            window?.makeFirstResponder(nil)
+            return
+        }
+        guard let key = KeyCodes.name(for: event.keyCode),
+              !flags.intersection([.control, .option, .command]).isEmpty else {
+            hint = "请包含 ⌘、⌥ 或 ⌃"
+            needsDisplay = true
+            return
+        }
         var modifiers: [String] = []
         if flags.contains(.control) { modifiers.append("control") }
         if flags.contains(.option) { modifiers.append("option") }
         if flags.contains(.command) { modifiers.append("command") }
         if flags.contains(.shift) { modifiers.append("shift") }
+        recordedKey = key
+        recordedModifiers = modifiers
         onCapture?(key, modifiers)
+        window?.makeFirstResponder(nil)
     }
+    override func draw(_ dirtyRect: NSRect) {
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 9, yRadius: 9)
+        NSColor.quaternaryLabelColor.withAlphaComponent(0.14).setFill()
+        path.fill()
+        (recording ? NSColor.controlAccentColor : NSColor.separatorColor).setStroke()
+        path.lineWidth = recording ? 1.5 : 1
+        path.stroke()
+        let text = recording ? (hint.isEmpty ? "按下组合键…（Esc 取消）" : hint)
+            : (recordedKey.isEmpty ? "点击后按下组合键…" : KeyCodes.display(recordedModifiers) + KeyCodes.keyLabel(recordedKey))
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byTruncatingTail
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: recordedKey.isEmpty || recording ? 13 : 15,
+                                     weight: recordedKey.isEmpty || recording ? .regular : .semibold),
+            .foregroundColor: recording ? NSColor.controlAccentColor : (recordedKey.isEmpty ? NSColor.secondaryLabelColor : NSColor.labelColor),
+            .paragraphStyle: style
+        ]
+        let line = text as NSString
+        let height = line.size(withAttributes: attributes).height
+        line.draw(in: NSRect(x: 12, y: (bounds.height - height) / 2, width: max(0, bounds.width - 48), height: height), withAttributes: attributes)
+        let symbol = NSImage(systemSymbolName: "keyboard", accessibilityDescription: nil)
+        symbol?.draw(in: NSRect(x: bounds.width - 28, y: (bounds.height - 14) / 2, width: 16, height: 14))
+    }
+}
+
+func runShortcutRecorderCheck() -> Never {
+    _ = NSApplication.shared
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 160),
+                          styleMask: [.titled], backing: .buffered, defer: false)
+    let recorder = ShortcutRecorderControl(frame: NSRect(x: 22, y: 60, width: 416, height: 44))
+    let other = NSButton(title: "其它按钮", target: nil, action: nil)
+    other.frame = NSRect(x: 22, y: 10, width: 100, height: 24)
+    window.contentView?.addSubview(recorder)
+    window.contentView?.addSubview(other)
+    var captured: [(String, [String])] = []
+    recorder.onCapture = { captured.append(($0, $1)) }
+    func key(_ code: UInt16, _ flags: NSEvent.ModifierFlags, _ chars: String) -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+                        windowNumber: window.windowNumber, context: nil, characters: chars,
+                        charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code)!
+    }
+    func require(_ condition: Bool, _ message: String) {
+        if !condition { print("✗ 录制框自检：" + message); exit(1) }
+    }
+    // 原控件不检查 bounds，导致其它区域也被命中；现在只覆盖自身完整区域。
+    require(window.contentView?.hitTest(NSPoint(x: 30, y: 80)) === recorder, "框左侧命中")
+    require(window.contentView?.hitTest(NSPoint(x: 420, y: 80)) === recorder, "框右侧命中")
+    require(window.contentView?.hitTest(NSPoint(x: 40, y: 20)) !== recorder, "不能挡住其它按钮")
+    require(recorder.startRecording() && window.firstResponder === recorder && recorder.recording, "点击后可聚焦")
+    recorder.keyDown(with: key(0, [], "a"))
+    require(captured.isEmpty && recorder.recording, "拒绝无修饰键")
+    _ = recorder.performKeyEquivalent(with: key(14, [.command, .option], "e"))
+    require(captured.last?.0 == "e" && Set(captured.last!.1) == ["command", "option"] && !recorder.recording, "⌘⌥E 录入")
+    require(!recorder.performKeyEquivalent(with: key(14, [.command], "e")), "失焦不抢快捷键")
+    _ = recorder.startRecording()
+    recorder.keyDown(with: key(53, [], "\u{1b}"))
+    require(!recorder.recording && captured.count == 1, "Esc 取消并保留原值")
+    _ = recorder.startRecording()
+    recorder.keyDown(with: key(51, [], "\u{8}"))
+    require(captured.last?.0 == "" && !recorder.recording, "退格清除")
+    print("✓ 录制框全区域命中、其它按钮不被遮挡、点击聚焦、组合键录入、失焦隔离、Esc 取消和退格清除通过")
+    exit(0)
 }
 
 /// 自绘开关：胶囊底 + 圆形滑块，跟着系统强调色走，未开启时是半透明灰
@@ -2753,6 +2848,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onQuit = { NSApp.terminate(nil) }
         model.onCloseWindow = { [weak self] in self?.settingsWindow?.close() }
         model.onToggleMenuBarIcon = { [weak self] in self?.toggleMenuBarIcon() }
+        model.onSetMenuBarIcon = { [weak self] style in
+            style.save()
+            self?.model.menuBarIconStyle = style
+            self?.applyStatusIcon()
+        }
         model.onToggleDockIcon = { [weak self] in self?.toggleDockIcon() }
         model.onToggleSelfHotkey = { [weak self] in self?.toggleSelfHotkey() }
         model.onCheckUpdate = { [weak self] in self?.checkForUpdates(manual: true) }
@@ -2910,13 +3010,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: 菜单栏图标
 
     private func setupStatusItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem.button {
-            let image = NSImage(systemSymbolName: "command", accessibilityDescription: "MacKit")
-            image?.isTemplate = true
-            button.image = image
-            button.toolTip = "MacKit — 快捷键启动 App"
-        }
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        applyStatusIcon()
+    }
+
+    private func applyStatusIcon() {
+        guard let button = statusItem?.button else { return }
+        let style = MenuBarIconStyle.load()
+        button.image = style.image
+        button.imagePosition = .imageOnly
+        button.toolTip = "MacKit — 快捷启动 · 剪贴板 · 常用工具 · 滚动控制"
+        model.menuBarIconStyle = style
     }
 
     // MARK: 菜单栏 / Dock 可见性
@@ -3598,8 +3702,8 @@ func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
         )
         .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
 
-    if page == .clipboard {
-        // ImageRenderer 不支持 TextField 等 AppKit 控件，改为真实 HostingView 离屏渲染。
+    if page == .clipboard || page == .settings {
+        // ImageRenderer 不支持原生滚动区域，改为 HostingView 离屏渲染。
         let host = NSHostingView(rootView: view)
         host.frame = NSRect(x: 0, y: 0, width: 720, height: 620)
         host.layoutSubtreeIfNeeded()
@@ -3798,6 +3902,9 @@ if CommandLine.arguments.contains("--print-default-shortcuts") {
     print(ShortcutConfiguration.json(ShortcutConfiguration.defaults))
     exit(0)
 }
+if CommandLine.arguments.contains("--batch-edit-check") { runBatchEditingCheck() }
+if CommandLine.arguments.contains("--shortcut-recorder-check") { runShortcutRecorderCheck() }
+if CommandLine.arguments.contains("--menubar-icon-check") { runMenuBarIconCheck() }
 if CommandLine.arguments.contains("--shortcut-config-check") { runShortcutConfigurationCheck() }
 if CommandLine.arguments.contains("--scroll-status") { runScrollStatus() }
 if CommandLine.arguments.contains("--scroll-check") { runScrollCheck() }

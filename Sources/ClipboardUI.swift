@@ -27,6 +27,8 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
     private var observation: Any?
     private var previousApp: NSRunningApplication?
     private var rows: [ClipboardEntry] = []
+    // nil 是不可选中的置顶分组标题；候选索引与表格行号分离。
+    private var tableRows: [Int?] = []
     private var controls: NSStackView!
     private var keyMonitor: Any?
     private var suppressClose = false
@@ -266,9 +268,23 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
 
     /// 自检用：按行号选中一条，触发右侧展开。
     func selectRow(_ index: Int) {
-        guard rows.indices.contains(index) else { return }
-        table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        guard rows.indices.contains(index), let row = tableRows.firstIndex(where: { $0 == index }) else { return }
+        table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
     }
+
+    /// 每次打开都从普通候选的 ⌘1 开始，不继承上次的置顶选择。
+    func prepareOpeningSelection() {
+        history.query = ""
+        search.stringValue = ""
+        table.deselectAll(nil)
+        reload()
+        if let index = rows.firstIndex(where: { !$0.pinned }) {
+            selectRow(index)
+            table.scrollRowToVisible(table.selectedRow)
+        }
+    }
+
+    var selectedCandidateID: String? { selectedEntry?.id }
 
     /// 自检用：清空选择，回到收起态。
     func clearSelection() {
@@ -308,10 +324,7 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor = nil }
         previousApp = NSWorkspace.shared.frontmostApplication
         if previousApp?.bundleIdentifier == Bundle.main.bundleIdentifier { previousApp = nil }
-        history.query = ""
-        search.stringValue = ""
-        table.deselectAll(nil)
-        reload()
+        prepareOpeningSelection()
         panel.center()
         panel.makeKeyAndOrderFront(nil)
         panel.contentView?.layoutSubtreeIfNeeded()
@@ -350,7 +363,9 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
     private func fitPanelHeight() {
         // 顶部搜索框与底部计数区；按钮共享计数区，选中前后高度一致。
         let chrome: CGFloat = 72
-        let tableHeight = rows.reduce(0) { $0 + Self.rowHeight(for: $1) }
+        let tableHeight = tableRows.reduce(CGFloat(0)) { height, index in
+            height + (index.map { Self.rowHeight(for: rows[$0]) } ?? 22)
+        }
         let limit = (NSScreen.main?.visibleFrame.height ?? 900) - 120
         let desired = max(220, min(chrome + tableHeight, min(560, limit)))
         var frame = panel.frame
@@ -372,12 +387,18 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
     private func reload() {
         let selected = selectedEntry?.id
         rows = Self.displayedRows(from: history.filtered, limit: history.maxVisible, searching: !history.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        tableRows = rows.indices.filter { !rows[$0].pinned }.map { Optional($0) }
+        let pinned = rows.indices.filter { rows[$0].pinned }
+        if !pinned.isEmpty {
+            tableRows.append(nil)
+            tableRows.append(contentsOf: pinned.map { Optional($0) })
+        }
         fitPanelHeight()
         fitTable()
         table.reloadData()
         countLabel.stringValue = rows.isEmpty ? "还没有记录。复制文字或图片后会自动出现在这里。" : "\(rows.count) 项 · \(history.storage.title)"
         if let index = selected.flatMap({ id in rows.firstIndex(where: { $0.id == id }) }) {
-            table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+            selectRow(index)
         } else {
             table.deselectAll(nil)
         }
@@ -395,25 +416,45 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         fitTable()
     }
 
-    private var selectedEntry: ClipboardEntry? {
-        guard rows.indices.contains(table.selectedRow) else { return nil }
-        return rows[table.selectedRow]
+    private func candidateIndex(forTableRow row: Int) -> Int? {
+        guard tableRows.indices.contains(row) else { return nil }
+        return tableRows[row]
     }
-    private func move(_ delta: Int) {
-        guard !rows.isEmpty else { return }
-        if table.selectedRow < 0 {
-            table.selectRowIndexes(IndexSet(integer: delta > 0 ? 0 : rows.count - 1), byExtendingSelection: false)
-            table.scrollRowToVisible(table.selectedRow)
-            return
+    private var selectedEntry: ClipboardEntry? {
+        guard let index = candidateIndex(forTableRow: table.selectedRow) else { return nil }
+        return rows[index]
+    }
+    func move(_ delta: Int) {
+        let selectable = tableRows.indices.filter { tableRows[$0] != nil }
+        guard !selectable.isEmpty else { return }
+        let next: Int
+        if let position = selectable.firstIndex(of: table.selectedRow) {
+            next = selectable[max(0, min(selectable.count - 1, position + delta))]
+        } else {
+            // 没有普通候选时，需显式按方向键或点选才进入置顶。
+            next = delta > 0 ? selectable[0] : selectable[selectable.count - 1]
         }
-        let next = max(0, min(rows.count - 1, table.selectedRow + delta))
         table.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
         table.scrollRowToVisible(next)
     }
-    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+    func numberOfRows(in tableView: NSTableView) -> Int { tableRows.count }
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        candidateIndex(forTableRow: row) != nil
+    }
+    func tableView(_ tableView: NSTableView, isGroupRow row: Int) -> Bool {
+        tableRows.indices.contains(row) && tableRows[row] == nil
+    }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard rows.indices.contains(row) else { return nil }
-        let entry = rows[row]
+        guard let index = candidateIndex(forTableRow: row) else {
+            let label = NSTextField(labelWithString: "置顶 · 独立快捷键")
+            label.font = .systemFont(ofSize: 10, weight: .medium)
+            label.textColor = .secondaryLabelColor
+            let group = NSStackView(views: [label])
+            group.edgeInsets = NSEdgeInsets(top: 4, left: 6, bottom: 2, right: 8)
+            group.setAccessibilityLabel("置顶 · 独立快捷键")
+            return group
+        }
+        let entry = rows[index]
         var views: [NSView] = []
 
         if entry.png != nil, let image = entry.image {
@@ -472,26 +513,27 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
     static func rowHeight(for entry: ClipboardEntry) -> CGFloat { entry.png != nil ? 46 : 30 }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        rows.indices.contains(row) ? Self.rowHeight(for: rows[row]) : 30
+        guard let index = candidateIndex(forTableRow: row) else { return 22 }
+        return Self.rowHeight(for: rows[index])
     }
 
     /// 置顶条目只显示自己配置的快捷键，不占 ⌘1–⌘9；非置顶按显示顺序编号。
     static func badge(for entry: ClipboardEntry, number: Int?) -> String {
-        if let label = entry.shortcutLabel { return label }
-        guard !entry.pinned, let number, (1...9).contains(number) else { return "" }
+        if entry.pinned { return entry.shortcutLabel ?? "" }
+        guard let number, (1...9).contains(number) else { return "" }
         return "⌘\(number)"
     }
 
     static func displayedRows(from filtered: [ClipboardEntry], limit: Int, searching: Bool) -> [ClipboardEntry] {
         let pinned = filtered.filter(\.pinned)
-        guard !searching else { return filtered }
-        return pinned + filtered.filter { !$0.pinned }.prefix(ClipboardHistory.clampedVisible(limit))
+        let regular = filtered.filter { !$0.pinned }
+        return (searching ? regular : Array(regular.prefix(ClipboardHistory.clampedVisible(limit)))) + pinned
     }
 
     private func number(forRow row: Int) -> Int? {
-        guard rows.indices.contains(row), !rows[row].pinned else { return nil }
-        let index = rows.prefix(row).filter { !$0.pinned }.count
-        return index < 9 ? index + 1 : nil
+        guard let index = candidateIndex(forTableRow: row), !rows[index].pinned else { return nil }
+        let number = rows.prefix(index).filter { !$0.pinned }.count
+        return number < 9 ? number + 1 : nil
     }
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         ClipboardRowView()
@@ -508,8 +550,8 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         fitTable()
         let index = rows.firstIndex { selectImage ? $0.png != nil : $0.png == nil }
         if let index {
-            table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-            table.scrollRowToVisible(index)
+            selectRow(index)
+            table.scrollRowToVisible(table.selectedRow)
             updatePreview()
         }
         return writeSnapshot(to: path)
@@ -595,9 +637,15 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         guard let entry = selectedEntry else { return }
         history.delete(entry); reload()
     }
+    func numberedCandidateID(_ number: Int) -> String? {
+        guard let row = tableRows.indices.first(where: { self.number(forRow: $0) == number }),
+              let index = candidateIndex(forTableRow: row) else { return nil }
+        return rows[index].id
+    }
+
     private func copyNumber(_ number: Int) {
-        guard let index = rows.indices.first(where: { self.number(forRow: $0) == number }) else { return }
-        table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        guard let id = numberedCandidateID(number), let index = rows.firstIndex(where: { $0.id == id }) else { return }
+        selectRow(index)
         copySelection()
     }
 
@@ -612,7 +660,13 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         suppressClose = true
-        if table.clickedRow >= 0 { table.selectRowIndexes(IndexSet(integer: table.clickedRow), byExtendingSelection: false) }
+        if table.clickedRow >= 0 {
+            if candidateIndex(forTableRow: table.clickedRow) != nil {
+                table.selectRowIndexes(IndexSet(integer: table.clickedRow), byExtendingSelection: false)
+            } else {
+                table.deselectAll(nil)
+            }
+        }
         let entry = selectedEntry
         for item in menu.items {
             switch item.title {
@@ -741,8 +795,8 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
     }
 
     @objc private func copySelection() {
-        if selectedEntry == nil, !rows.isEmpty {
-            table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        if selectedEntry == nil, let index = rows.firstIndex(where: { !$0.pinned }) {
+            selectRow(index)
         }
         guard let entry = selectedEntry, history.copy(entry) else { return }
         let target = previousApp
@@ -1165,10 +1219,14 @@ func runClipboardCheck() -> Never {
               ClipboardPanelController.badge(for: numbered, number: 10) == "",
               ClipboardPanelController.badge(for: numbered, number: nil) == "",
               ClipboardPanelController.badge(for: pinnedSample, number: 1) == "" else { throw ClipboardError.invalidArchive }
+        var oldRegularShortcut = numbered
+        oldRegularShortcut.shortcutKey = "m"
+        oldRegularShortcut.shortcutModifiers = ["command"]
+        guard ClipboardPanelController.badge(for: oldRegularShortcut, number: 1) == "⌘1" else { throw ClipboardError.invalidArchive }
         // 置顶不占编号、非置顶按显示顺序编号，显示条数可设置
         let listing = [pinnedSample, numbered] + (1...5).map { ClipboardEntry.make(text: "行 \($0)", now: Double($0 + 2))! }
         let shown = ClipboardPanelController.displayedRows(from: listing, limit: 3, searching: false)
-        guard shown.count == 4, shown.first?.pinned == true,
+        guard shown.count == 4, shown.first?.id == numbered.id, shown.last?.pinned == true,
               ClipboardPanelController.displayedRows(from: listing, limit: 3, searching: true).count == listing.count,
               ClipboardPanelController.displayedRows(from: listing, limit: 1, searching: false).count == 2 else { throw ClipboardError.invalidArchive }
         history.setMaxVisible(0)
@@ -1228,6 +1286,45 @@ func runClipboardCheck() -> Never {
         let linked = ClipboardHistory(defaults: badDefaults, board: board, localURL: symlink)
         linked.chooseStorage(.local)
         guard linked.storage == .memory else { throw ClipboardError.invalidArchive }
+        stage = "opening-selection"
+        let openingSuite = suite + "-opening"
+        let openingDefaults = UserDefaults(suiteName: openingSuite)!
+        defer { openingDefaults.removePersistentDomain(forName: openingSuite) }
+        let openingHistory = ClipboardHistory(defaults: openingDefaults, board: board, localURL: root.appendingPathComponent("opening.json"))
+        let openingTime = Date().timeIntervalSince1970 + 100
+        let recent = ClipboardEntry.make(text: "普通候选一", now: openingTime + 2)!
+        let older = ClipboardEntry.make(text: "普通候选二", now: openingTime + 1)!
+        var pin = ClipboardEntry.make(text: "独立置顶", now: openingTime + 3)!
+        pin.pinned = true
+        pin.shortcutKey = "1"
+        pin.shortcutModifiers = ["command"]
+        [recent, older, pin].forEach { openingHistory.insert($0) }
+        let opening = ClipboardPanelController(history: openingHistory)
+        opening.prepareOpeningSelection()
+        guard opening.selectedCandidateID == recent.id, opening.numberedCandidateID(1) == recent.id,
+              opening.numberedCandidateID(2) == older.id, opening.numberedCandidateID(3) == nil,
+              opening.validateLayout() else { throw ClipboardError.invalidArchive }
+        opening.move(1)
+        guard opening.selectedCandidateID == older.id else { throw ClipboardError.invalidArchive }
+        opening.move(1)
+        guard opening.selectedCandidateID == pin.id else { throw ClipboardError.invalidArchive }
+        opening.move(-1)
+        guard opening.selectedCandidateID == older.id else { throw ClipboardError.invalidArchive }
+        opening.prepareOpeningSelection()
+        guard opening.selectedCandidateID == recent.id else { throw ClipboardError.invalidArchive }
+        openingHistory.query = "置顶"
+        let searched = ClipboardPanelController(history: openingHistory)
+        guard searched.numberedCandidateID(1) == nil else { throw ClipboardError.invalidArchive }
+        openingHistory.delete(recent)
+        openingHistory.delete(older)
+        opening.prepareOpeningSelection()
+        guard opening.selectedCandidateID == nil, !opening.isControlRowVisible else { throw ClipboardError.invalidArchive }
+        opening.move(1)
+        guard opening.selectedCandidateID == pin.id else { throw ClipboardError.invalidArchive }
+        openingHistory.delete(pin)
+        opening.prepareOpeningSelection()
+        guard opening.selectedCandidateID == nil, opening.validateLayout() else { throw ClipboardError.invalidArchive }
+        print("✓ 普通候选优先、打开重置⌘1、置顶独立分组、方向键跳过标题、搜索与空列表通过")
         stage = "controller"
         // 加足列表高度，避免 220pt 最小高度掩盖选中后额外增高的问题。
         let layoutTime = Date().timeIntervalSince1970 + 10

@@ -352,6 +352,14 @@ enum Preferences {
     private static let quitWhitelistKey = "quitAllWhitelist"
 
     /// 一键关闭所有 App 时豁免的 bundle id / 路径
+    private static let emptyTrashKey = "emptyTrashOnClean"
+
+    /// 一键清理时是否顺带清空废纸篓
+    static var emptyTrashOnClean: Bool {
+        get { UserDefaults.standard.bool(forKey: emptyTrashKey) }
+        set { UserDefaults.standard.set(newValue, forKey: emptyTrashKey) }
+    }
+
     private static let syncHotkeysKey = "syncHotkeys"
     private static let syncSidebarOrderKey = "syncSidebarOrder"
     private static let syncQuitWhitelistKey = "syncQuitWhitelistKey"
@@ -623,7 +631,27 @@ enum RecordCleaner {
         return (count, nil)
     }
 
-    static func clear(safariHistory: Bool, recentFiles: Bool, range: HistoryRange) -> Result {
+    /// 清空 ~/.Trash 里的内容（不删除废纸篓目录本身）
+    static func emptyTrashContents(in directory: URL? = nil) -> (deleted: Int, failed: Int) {
+        let fm = FileManager.default
+        let trash = directory ?? fm.homeDirectoryForCurrentUser.appendingPathComponent(".Trash", isDirectory: true)
+        guard let items = try? fm.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil) else {
+            return (0, 0)
+        }
+        var deleted = 0
+        var failed = 0
+        for item in items {
+            do {
+                try fm.removeItem(at: item)
+                deleted += 1
+            } catch {
+                failed += 1
+            }
+        }
+        return (deleted, failed)
+    }
+
+    static func clear(safariHistory: Bool, recentFiles: Bool, emptyTrash: Bool, range: HistoryRange) -> Result {
         var lines: [String] = []
         var needsFDA = false
 
@@ -647,6 +675,17 @@ enum RecordCleaner {
                 } else {
                     lines.append("最近使用文件记录：没有可清空的记录")
                 }
+            }
+        }
+
+        if emptyTrash {
+            let outcome = emptyTrashContents()
+            if outcome.deleted == 0 && outcome.failed == 0 {
+                lines.append("废纸篓：本来就是空的")
+            } else if outcome.failed > 0 {
+                lines.append("废纸篓：已清空 \(outcome.deleted) 项，\(outcome.failed) 项删除失败")
+            } else {
+                lines.append("废纸篓：已清空 \(outcome.deleted) 项")
             }
         }
 
@@ -1141,14 +1180,26 @@ final class MacKitModel: ObservableObject {
     @Published var clearSafariHistory: Bool = true
     @Published var historyRange: HistoryRange = .today
     @Published var clearRecentFiles: Bool = true
+    @Published var emptyTrash: Bool = Preferences.emptyTrashOnClean {
+        didSet { Preferences.emptyTrashOnClean = emptyTrash }
+    }
     @Published var toolsStatus: String = ""
     @Published var toolsNeedsFullDiskAccess: Bool = false
     @Published var toolsLastRun: Date?
     @Published var showQuitSafariConfirm: Bool = false
 
+    var clearConfirmMessage: String {
+        var parts: [String] = []
+        if clearSafariHistory { parts.append("Safari 浏览记录（\(historyRange.title)）") }
+        if clearRecentFiles { parts.append("最近使用文件记录") }
+        if emptyTrash { parts.append("废纸篓（不可恢复）") }
+        guard !parts.isEmpty else { return "先勾选要清理的选项。" }
+        return "将清理：" + parts.joined(separator: "、") + "。清空后无法恢复。"
+    }
+
     /// 点「清空」后的入口：Safari 在跑就先问要不要退
     func requestClearRecords() {
-        guard clearSafariHistory || clearRecentFiles else {
+        guard clearSafariHistory || clearRecentFiles || emptyTrash else {
             toolsStatus = "先勾选要清理的选项"
             return
         }
@@ -1169,13 +1220,14 @@ final class MacKitModel: ObservableObject {
     }
 
     func clearSelectedRecords() {
-        guard clearSafariHistory || clearRecentFiles else {
+        guard clearSafariHistory || clearRecentFiles || emptyTrash else {
             toolsStatus = "先勾选要清理的选项"
             return
         }
         let result = RecordCleaner.clear(
             safariHistory: clearSafariHistory,
             recentFiles: clearRecentFiles,
+            emptyTrash: emptyTrash,
             range: historyRange
         )
         toolsStatus = result.message
@@ -1292,7 +1344,7 @@ struct SettingsView: View {
             Button("清空", role: .destructive) { model.requestClearRecords() }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("Safari 浏览记录和最近使用文件记录，清空后无法恢复。")
+            Text(model.clearConfirmMessage)
         }
 
     }
@@ -1416,9 +1468,15 @@ struct SettingsView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .clipped()
+            } else if page == .tools {
+                ScrollView(.vertical, showsIndicators: true) {
+                    toolsPage.padding(.trailing, 6).padding(.bottom, 8)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
             } else {
                 switch page {
-                case .tools: toolsPage
+                case .tools: EmptyView()
                 case .launcher: launcherPage
                 case .menuBar: menuBarPage
                 case .clipboard: EmptyView()
@@ -1788,6 +1846,12 @@ struct SettingsView: View {
                     symbol: "clock.arrow.circlepath",
                     isOn: $model.clearRecentFiles
                 )
+                toolRow(
+                    "清空废纸篓",
+                    subtitle: "删除废纸篓里的全部内容，不可恢复",
+                    symbol: "trash.slash",
+                    isOn: $model.emptyTrash
+                )
             }
 
             HStack {
@@ -1799,7 +1863,7 @@ struct SettingsView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.red)
-                .disabled(!model.clearSafariHistory && !model.clearRecentFiles)
+                .disabled(!model.clearSafariHistory && !model.clearRecentFiles && !model.emptyTrash)
 
                 Spacer()
             }
@@ -4302,7 +4366,7 @@ func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
         )
         .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
 
-    if page == .clipboard || page == .settings {
+    if page == .clipboard || page == .settings || page == .tools {
         // ImageRenderer 不支持原生滚动区域，改为 HostingView 离屏渲染。
         let host = NSHostingView(rootView: view)
         host.frame = NSRect(x: 0, y: 0, width: 720, height: 620)
@@ -4444,6 +4508,27 @@ func runOCRTranslateTest(_ path: String) -> Never {
         RunLoop.current.run(until: Date().addingTimeInterval(0.1))
     }
     exit(0)
+}
+
+// MARK: - 废纸篓清理自检（--trash-test，用临时目录验证）
+
+func runTrashTest() -> Never {
+    let fm = FileManager.default
+    let dir = fm.temporaryDirectory.appendingPathComponent("mackit-trash-test", isDirectory: true)
+    try? fm.removeItem(at: dir)
+    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    for name in ["a.txt", "b.txt"] {
+        try? "x".write(to: dir.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+    try? fm.createDirectory(at: dir.appendingPathComponent("sub"), withIntermediateDirectories: true)
+    try? "y".write(to: dir.appendingPathComponent("sub/c.txt"), atomically: true, encoding: .utf8)
+
+    let before = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil))?.count ?? 0
+    let result = RecordCleaner.emptyTrashContents(in: dir)
+    let after = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil))?.count ?? 0
+    print("测试目录：清理前 \(before) 项，删除 \(result.deleted) 项、失败 \(result.failed) 项，剩余 \(after) 项")
+    try? fm.removeItem(at: dir)
+    exit(after == 0 && result.failed == 0 ? 0 : 1)
 }
 
 // MARK: - OCR 结果窗口自检（--ocr-window-test <png>，会短暂弹出结果窗口）
@@ -4620,6 +4705,7 @@ if let index = CommandLine.arguments.firstIndex(of: "--ocr-translate-test"), Com
     if #available(macOS 15.0, *) { runOCRTranslateTest(CommandLine.arguments[index + 1]) }
     exit(0)
 }
+if CommandLine.arguments.contains("--trash-test") { runTrashTest() }
 if let index = CommandLine.arguments.firstIndex(of: "--ocr-window-test"), CommandLine.arguments.count > index + 1 {
     runOCRWindowTest(CommandLine.arguments[index + 1])
 }

@@ -1902,9 +1902,6 @@ struct SettingsView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
 
-            sectionLabel("卸载 App")
-            uninstallCard
-
             sectionLabel("批量关闭")
             quitAllCard
                 .alert("关闭所有 App？", isPresented: $model.showQuitAllConfirm) {
@@ -1913,6 +1910,9 @@ struct SettingsView: View {
                 } message: {
                     Text("将关闭 \(model.quitTargetCount) 个 App，白名单中的 \(model.quitWhitelist.count) 个会保留。未保存的内容可能弹出保存提示。")
                 }
+
+            sectionLabel("卸载 App")
+            uninstallCard
         }
         .alert("Safari 正在运行", isPresented: $model.showQuitSafariConfirm) {
             Button("退出 Safari 并清空", role: .destructive) { model.quitSafariAndClear() }

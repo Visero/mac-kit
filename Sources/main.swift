@@ -1319,7 +1319,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text("MacKit")
                     .font(.system(size: 13, weight: .semibold, design: .rounded))
-                Text("菜单栏效率工具集")
+                Text("效率工具集")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }

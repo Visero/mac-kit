@@ -1238,7 +1238,7 @@ struct SettingsView: View {
                 .frame(width: 1)
             detail
         }
-        .frame(width: 720, height: 620)
+        .frame(minWidth: 720, minHeight: 620)
         .sheet(isPresented: $viewState.showAddShortcut) {
             AddShortcutView(
                 onAdd: { key, modifiers, target in
@@ -2731,7 +2731,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 720, height: 620),
-            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -2742,6 +2742,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.backgroundColor = .clear
         window.isOpaque = false
         window.isReleasedWhenClosed = false
+        window.contentMinSize = NSSize(width: 720, height: 620)
+        window.setContentSize(NSSize(width: 720, height: 620))
 
         super.init(window: window)
 
@@ -4247,6 +4249,7 @@ func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
     }
 
     let view = SettingsView(model: model)
+        .frame(width: 720, height: 620)
         .background(
             LinearGradient(
                 colors: [Color(red: 0.36, green: 0.40, blue: 0.50), Color(red: 0.09, green: 0.10, blue: 0.14)],

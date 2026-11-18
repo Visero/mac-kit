@@ -550,7 +550,8 @@ private struct SyncToggleRow: View {
             Spacer(minLength: 8)
             GlassSwitch(isOn: $isOn)
         }
-        .padding(.horizontal, 9)
+        // 仅缩进文字；开关与总开关、更新开关共享同一右边缘。
+        .padding(.leading, 9)
         .padding(.vertical, 4)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)

@@ -11,11 +11,23 @@ private final class ClipboardPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+private final class ClipboardTableView: NSTableView {
+    var onRowClick: ((Int, NSEvent) -> Bool)?
+
+    override func mouseDown(with event: NSEvent) {
+        let clicked = row(at: convert(event.locationInWindow, from: nil))
+        // 直接响应有效左键，避免 NSTableView 等待 mouseUp 或选择变更；
+        // 未被处理的空白、分组与 Control 点击仍交给原生表格。
+        if onRowClick?(clicked, event) == true { return }
+        super.mouseDown(with: event)
+    }
+}
+
 final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSWindowDelegate, NSMenuDelegate {
     private let history: ClipboardHistory
     private let panel: ClipboardPanel
     private let search = NSSearchField()
-    private let table = NSTableView()
+    private let table = ClipboardTableView()
     private let countLabel = NSTextField(labelWithString: "")
     private let detailIcon = NSImageView()
     private let detailSource = NSTextField(labelWithString: "")
@@ -97,8 +109,9 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         table.autoresizingMask = [.width]
         table.dataSource = self
         table.delegate = self
-        table.target = self
-        table.doubleAction = #selector(copySelection)
+        table.onRowClick = { [weak self] row, event in
+            self?.handleRowClick(row, eventType: event.type, modifiers: event.modifierFlags) ?? false
+        }
         let menu = NSMenu()
         menu.delegate = self
         menu.autoenablesItems = false
@@ -646,7 +659,8 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         return rows[index].id
     }
 
-    private func copyNumber(_ number: Int) {
+    // 与 ⌘数字共用的实际取用路径，也用于隔离回归验证。
+    func copyNumber(_ number: Int) {
         guard let id = numberedCandidateID(number), let index = rows.firstIndex(where: { $0.id == id }) else { return }
         selectRow(index)
         copySelection()
@@ -808,6 +822,55 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         }
         history.setShortcut(entry, key: key, modifiers: modifiers)
         status.stringValue = ""
+        return true
+    }
+
+    /// 使用隔离历史和剪贴板时的原生事件回归；鼠标事件只派发到本浮层。
+    func verifySingleClick() -> Bool {
+        guard table.onRowClick != nil,
+              let second = numberedCandidateID(2), let before = history.entry(id: second) else { return false }
+        prepareOpeningSelection()
+        let previewArchive = history.archive
+        move(1)
+        guard history.archive == previewArchive else { return false }
+        handleRowClick(0, eventType: .rightMouseDown)
+        handleRowClick(0, eventType: .leftMouseDown, modifiers: [.control])
+        handleRowClick(-1, eventType: .leftMouseUp)
+        if let group = tableRows.firstIndex(where: { $0 == nil }) {
+            handleRowClick(group, eventType: .leftMouseUp)
+        }
+        guard history.archive == previewArchive else { return false }
+        panel.makeKeyAndOrderFront(nil)
+        panel.contentView?.layoutSubtreeIfNeeded()
+        fitTable()
+        guard let row = tableRows.indices.first(where: { number(forRow: $0) == 2 }) else { return false }
+        let rowRect = table.rect(ofRow: row)
+        let point = table.convert(NSPoint(x: 25, y: rowRect.midY), to: nil)
+        guard let down = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
+                                           timestamp: ProcessInfo.processInfo.systemUptime,
+                                           windowNumber: panel.windowNumber, context: nil,
+                                           eventNumber: 1, clickCount: 1, pressure: 1) else { return false }
+        // 直接派发原生表格 mouseDown，隔离测试不注入系统鼠标。
+        table.mouseDown(with: down)
+        let copied = history.entry(id: second)?.copiedAt ?? 0
+        let closed = !panel.isVisible
+        closePanel()
+        prepareOpeningSelection()
+        if !(copied > before.copiedAt && closed && numberedCandidateID(1) == second) {
+            print("单击回归诊断：copied=\(copied > before.copiedAt) closed=\(closed) first=\(numberedCandidateID(1) == second) clickedRow=\(table.clickedRow)")
+        }
+        return copied > before.copiedAt && closed && numberedCandidateID(1) == second
+    }
+
+    /// 仅左键有效条目走与 Enter 相同的取用路径；不依赖选择变更通知，
+    /// 因而再次点击已选中的第一条也能取用，右键菜单和程序化选中不受影响。
+    @discardableResult
+    func handleRowClick(_ row: Int, eventType: NSEvent.EventType, modifiers: NSEvent.ModifierFlags = []) -> Bool {
+        guard eventType == .leftMouseDown || eventType == .leftMouseUp,
+              !modifiers.contains(.control),
+              let index = candidateIndex(forTableRow: row) else { return false }
+        selectRow(index)
+        copySelection()
         return true
     }
 
@@ -1342,6 +1405,97 @@ func runClipboardCheck() -> Never {
         opening.prepareOpeningSelection()
         guard opening.selectedCandidateID == nil, opening.validateLayout() else { throw ClipboardError.invalidArchive }
         print("✓ 普通候选优先、打开重置⌘1、置顶独立分组、方向键跳过标题、搜索与空列表通过")
+        stage = "used-order-and-dedup"
+        let usedSuite = suite + "-used"
+        let usedDefaults = UserDefaults(suiteName: usedSuite)!
+        defer { usedDefaults.removePersistentDomain(forName: usedSuite) }
+        let usedURL = root.appendingPathComponent("used.json")
+        let usedHistory = ClipboardHistory(defaults: usedDefaults, board: board, localURL: usedURL)
+        let usedTime = Date().timeIntervalSince1970 + 100
+        let usedOld = ClipboardEntry.make(text: "取用较早内容", source: "原来源", now: usedTime)!
+        let usedRecent = ClipboardEntry.make(text: "取用较新内容", now: usedTime + 1)!
+        var usedPin = ClipboardEntry.make(text: "保留独立置顶", now: usedTime + 2)!
+        usedPin.pinned = true
+        [usedOld, usedRecent, usedPin].forEach { usedHistory.insert($0) }
+        usedHistory.chooseStorage(.local)
+        let usedPanel = ClipboardPanelController(history: usedHistory)
+        usedPanel.prepareOpeningSelection()
+        let beforePreview = usedHistory.archive
+        usedPanel.selectRow(1)
+        guard usedPanel.selectedCandidateID == usedOld.id,
+              usedHistory.archive == beforePreview else { throw ClipboardError.invalidArchive }
+        usedPanel.copyNumber(2) // 实际 ⌘2 取用路径：关闭浮层并成功写入隔离剪贴板。
+        usedPanel.prepareOpeningSelection()
+        guard board.string(forType: .string) == usedOld.text,
+              usedPanel.numberedCandidateID(1) == usedOld.id, usedPanel.selectedCandidateID == usedOld.id,
+              usedPanel.numberedCandidateID(2) == usedRecent.id,
+              usedHistory.entries.count == 3, usedHistory.entry(id: usedOld.id)?.source == "原来源",
+              usedHistory.entry(id: usedOld.id)!.copiedAt > usedRecent.copiedAt else { throw ClipboardError.invalidArchive }
+        let firstUseTime = usedHistory.entry(id: usedOld.id)!.copiedAt
+        guard usedHistory.copy(usedOld), usedHistory.entry(id: usedOld.id)!.copiedAt > firstUseTime,
+              usedHistory.entries.filter({ $0.id == usedOld.id }).count == 1 else { throw ClipboardError.invalidArchive }
+        usedHistory.poll()
+        guard usedHistory.entries.count == 3, ClipboardHistory.capture(board) == nil else { throw ClipboardError.invalidArchive }
+        // 其它 App 再次复制相同文字仍只保留原条目。
+        board.clearContents()
+        board.setString(usedOld.text!, forType: .string)
+        usedHistory.poll()
+        guard usedHistory.entries.count == 3,
+              usedHistory.entries.filter({ $0.id == usedOld.id }).count == 1 else { throw ClipboardError.invalidArchive }
+        // 图片也前置、去重；失败的无效内容不修改剪贴板或排序。
+        let usedImage = ClipboardEntry.make(png: png, source: "图片来源", now: usedTime - 1)!
+        usedHistory.insert(usedImage)
+        guard usedHistory.copy(usedImage), usedHistory.copy(usedImage), board.data(forType: .png) == png,
+              usedHistory.entries.filter({ $0.id == usedImage.id }).count == 1 else { throw ClipboardError.invalidArchive }
+        usedPanel.prepareOpeningSelection()
+        guard usedPanel.numberedCandidateID(1) == usedImage.id else { throw ClipboardError.invalidArchive }
+        let invalidCopy = ClipboardEntry(id: "invalid", kind: .text, text: "", png: nil,
+                                         copiedAt: 0, editedAt: 0, pinned: false, source: "")
+        let beforeInvalid = usedHistory.archive
+        let boardChange = board.changeCount
+        guard !usedHistory.copy(invalidCopy), usedHistory.archive == beforeInvalid,
+              board.changeCount == boardChange else { throw ClipboardError.invalidArchive }
+        usedHistory.setShortcut(usedPin, key: "m", modifiers: ["command"])
+        guard usedHistory.copy(usedPin), usedHistory.entry(id: usedPin.id)?.pinned == true,
+              usedHistory.entry(id: usedPin.id)?.shortcutLabel == "⌘M" else { throw ClipboardError.invalidArchive }
+        usedPanel.prepareOpeningSelection()
+        guard usedPanel.numberedCandidateID(1) == usedImage.id,
+              usedHistory.entries.count == 4 else { throw ClipboardError.invalidArchive }
+        guard usedHistory.copy(usedOld) else { throw ClipboardError.invalidArchive }
+        let usedDisk = try JSONDecoder().decode(ClipboardArchive.self, from: Data(contentsOf: usedURL)).validated()
+        guard usedDisk.entries.filter({ $0.id == usedOld.id }).count == 1,
+              usedDisk.entries.first(where: { !$0.pinned })?.id == usedOld.id else { throw ClipboardError.invalidArchive }
+        // 旧文件含重复记录：载入按最新记录去重，不改格式。
+        var duplicateDisk = usedDisk
+        duplicateDisk.entries.append(usedDisk.entries.first(where: { $0.id == usedOld.id })!)
+        try JSONEncoder().encode(duplicateDisk).write(to: usedURL)
+        let usedReload = ClipboardHistory(defaults: usedDefaults, board: board, localURL: usedURL)
+        usedReload.start(); usedReload.stop()
+        guard usedReload.entries.count == 4,
+              usedReload.entries.first(where: { !$0.pinned })?.id == usedOld.id,
+              ClipboardArchive.bounded(duplicateDisk.entries).count == 4 else { throw ClipboardError.invalidArchive }
+        let usedCloud = root.appendingPathComponent("UsedCloud", isDirectory: true)
+        try FileManager.default.createDirectory(at: usedCloud, withIntermediateDirectories: true)
+        usedHistory.setCloudFolder(usedCloud)
+        usedReload.setCloudFolder(usedCloud)
+        guard usedReload.copy(usedRecent) else { throw ClipboardError.invalidArchive }
+        usedHistory.syncNow()
+        guard usedHistory.entries.count == 4,
+              usedHistory.entries.first(where: { !$0.pinned })?.id == usedRecent.id,
+              usedHistory.entry(id: usedPin.id)?.shortcutLabel == "⌘M",
+              ClipboardArchive.merge(usedDisk, usedHistory.archive).entries.count == 4 else { throw ClipboardError.invalidArchive }
+        print("✓ 实际⌘数字取用后下次为⌘1、仅预览不复制、连续取用、文字/图片去重、置顶快捷键保留、本机重载及同步排序通过（隔离剪贴板）")
+        stage = "single-click"
+        let clickPanel = ClipboardPanelController(history: usedHistory)
+        guard clickPanel.verifySingleClick() else {
+            throw NSError(domain: "check", code: 1, userInfo: [NSLocalizedDescriptionKey: "原生鼠标单击未完成复制/关闭/下次首项，或干扰浏览与右键"])
+        }
+        let clickFirst = clickPanel.numberedCandidateID(1)!
+        let beforeSameClick = usedHistory.entry(id: clickFirst)!.copiedAt
+        clickPanel.handleRowClick(0, eventType: .leftMouseUp)
+        guard usedHistory.entry(id: clickFirst)!.copiedAt > beforeSameClick,
+              usedHistory.entries.count == 4 else { throw ClipboardError.invalidArchive }
+        print("✓ 原生左键单击复制并关闭、已选中条目取用、右键/Control点击/空白/标题不复制及键盘浏览通过（隔离剪贴板）")
         stage = "controller"
         // 加足列表高度，避免 220pt 最小高度掩盖选中后额外增高的问题。
         let layoutTime = Date().timeIntervalSince1970 + 10

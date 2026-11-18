@@ -28,28 +28,19 @@ enum ImageOCR {
             return nil
         }
         return await withCheckedContinuation { continuation in
-            var resumed = false
-            func finish(_ text: String?) {
-                guard !resumed else { return }
-                resumed = true
-                continuation.resume(returning: text)
-            }
-
-            let request = VNRecognizeTextRequest { request, _ in
-                let lines = (request.results as? [VNRecognizedTextObservation])?
-                    .compactMap { $0.topCandidates(1).first?.string } ?? []
-                finish(lines.isEmpty ? nil : lines.joined(separator: "\n"))
-            }
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = true
-            request.recognitionLanguages = languages
-
-            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
             DispatchQueue.global(qos: .userInitiated).async {
+                // Vision 对象仅在执行队列创建和使用，不跨并发边界传递。
+                let request = VNRecognizeTextRequest()
+                request.recognitionLevel = .accurate
+                request.usesLanguageCorrection = true
+                request.recognitionLanguages = languages
+                let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
                 do {
                     try handler.perform([request])
+                    let lines = request.results?.compactMap { $0.topCandidates(1).first?.string } ?? []
+                    continuation.resume(returning: lines.isEmpty ? nil : lines.joined(separator: "\n"))
                 } catch {
-                    finish(nil)
+                    continuation.resume(returning: nil)
                 }
             }
         }
@@ -69,17 +60,10 @@ final class AppleTranslationService: ObservableObject {
     private var pending: [(String, String, (String?) -> Void)] = []
     private var busy = false
 
-    var isAvailable: Bool {
-        if #available(macOS 15.0, *) { return true }
-        return false
-    }
+    var isAvailable: Bool { true }
 
     /// 把文字翻译成指定语言；失败时回调 nil
     func translate(_ text: String, to language: String = "zh-Hans", completion: @escaping (String?) -> Void) {
-        guard #available(macOS 15.0, *) else {
-            completion(nil)
-            return
-        }
         // 隐藏窗口必须在主线程创建
         guard Thread.isMainThread else {
             DispatchQueue.main.async { [weak self] in

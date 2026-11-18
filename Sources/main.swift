@@ -1154,6 +1154,8 @@ final class MacKitModel: ObservableObject {
     // 更新检查
     @Published var autoUpdateCheck: Bool = Preferences.autoUpdateCheck
     @Published var updateStatus: String = ""
+    @Published var updateError: String = ""
+    @Published var checkingUpdate = false
     @Published var availableUpdate: UpdateChecker.Release?
     private var dragStartIndex = 0
     private let sidebarRowHeight: CGFloat = 34
@@ -1370,16 +1372,12 @@ struct SettingsView: View {
 
             Spacer(minLength: 0)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text("v\(UpdateChecker.currentVersion)")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Text("⌥⌘, 随时打开设置")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(.leading, 10)
-            .padding(.bottom, 4)
+            Text("v\(UpdateChecker.currentVersion)")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 10)
+                .padding(.bottom, 4)
+                .accessibilityIdentifier("sidebarVersion")
         }
         .padding(.horizontal, 12)
         .padding(.top, 18)
@@ -1656,7 +1654,7 @@ struct SettingsView: View {
             sectionLabel("同步")
             MacKitSyncSettingsCard(engine: model.syncEngine)
 
-            sectionLabel("版本升级")
+            sectionLabel("更新")
             updateRows
         }
     }
@@ -1733,56 +1731,62 @@ struct SettingsView: View {
     }
 
     private var updateRows: some View {
-        VStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
-                settingsLabel("版本 \(UpdateChecker.currentVersion)", symbol: "info.circle")
-                Spacer(minLength: 8)
+                if model.checkingUpdate {
+                    ProgressView().controlSize(.small).frame(width: 18, height: 18)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 13)).frame(width: 18, height: 18)
+                }
                 Text(model.updateStatus)
                     .font(.system(size: 11))
                     .foregroundStyle(model.availableUpdate == nil ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.accentColor))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Button("检查更新") {
-                    model.onCheckUpdate()
-                }
-                .font(.system(size: 11))
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(.quaternary.opacity(0.4))
-            )
-
-            HStack(spacing: 10) {
-                settingsLabel("自动检查更新", symbol: "clock.arrow.circlepath")
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("updateStatus")
                 Spacer(minLength: 8)
-                GlassSwitch(isOn: Binding(
-                    get: { model.autoUpdateCheck },
-                    set: { _ in model.onToggleAutoUpdate() }
-                ))
+                Button(model.checkingUpdate ? "正在检查…" : "检查更新", action: model.onCheckUpdate)
+                    .font(.system(size: 11))
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .disabled(model.checkingUpdate)
+                    .accessibilityIdentifier("checkUpdate")
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(.quaternary.opacity(0.4))
-            )
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(.quaternary.opacity(0.4)))
 
+            if !model.updateError.isEmpty {
+                Text(model.updateError)
+                    .font(.system(size: 10)).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 4)
+                    .accessibilityIdentifier("updateError")
+            }
+            automaticUpdateRow
             if let update = model.availableUpdate {
                 HStack {
                     Spacer()
-                    Button("下载 \(update.version)") {
-                        model.onOpenUpdate()
-                    }
-                    .font(.system(size: 11))
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
+                    Button("下载 \(update.version)", action: model.onOpenUpdate)
+                        .font(.system(size: 11)).buttonStyle(.borderedProminent).controlSize(.small)
+                        .accessibilityIdentifier("downloadUpdate")
                 }
             }
         }
+    }
+
+    private var automaticUpdateRow: some View {
+        HStack(spacing: 10) {
+            settingsLabel("自动检查更新", symbol: "clock.arrow.circlepath")
+            Spacer(minLength: 8)
+            GlassSwitch(isOn: Binding(
+                get: { model.autoUpdateCheck },
+                set: { _ in model.onToggleAutoUpdate() }
+            ))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(.quaternary.opacity(0.4)))
     }
 
     private func settingsLabel(_ title: String, symbol: String) -> some View {
@@ -3117,100 +3121,7 @@ final class MenuBarHider {
 
 // MARK: - 检查更新（GitHub Release）
 
-enum UpdateChecker {
-    struct Release {
-        let version: String
-        let pageURL: URL
-        let notes: String?
-    }
-
-    struct CheckError: LocalizedError {
-        let message: String
-        var errorDescription: String? { message }
-    }
-
-    private static let repo = "Visero/mac-kit"
-
-    static var currentVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
-    }
-
-    static var currentBuild: String {
-        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
-    }
-
-    private static func request(_ path: String, completion: @escaping (Data?, Int, Error?) -> Void) {
-        guard let url = URL(string: "https://api.github.com/repos/\(repo)\(path)") else {
-            completion(nil, 0, CheckError(message: "地址无效"))
-            return
-        }
-        var req = URLRequest(url: url, timeoutInterval: 12)
-        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        req.setValue("MacKit/\(currentVersion)", forHTTPHeaderField: "User-Agent")
-        URLSession.shared.dataTask(with: req) { data, response, error in
-            completion(data, (response as? HTTPURLResponse)?.statusCode ?? 0, error)
-        }.resume()
-    }
-
-    /// 优先读最新 Release；没有 Release 时退回 tags。`nil` 表示仓库还没有任何版本。
-    static func check(completion: @escaping (Result<Release?, Error>) -> Void) {
-        request("/releases/latest") { data, code, error in
-            if let error = error {
-                completion(.failure(error))
-                return
-            }
-            if code == 200, let data = data, let release = parseRelease(data) {
-                completion(.success(release))
-                return
-            }
-            guard code == 404 else {
-                completion(.failure(CheckError(message: "GitHub 返回 \(code)")))
-                return
-            }
-            request("/tags") { data, code, error in
-                if let error = error {
-                    completion(.failure(error))
-                    return
-                }
-                guard code == 200, let data = data,
-                      let tags = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-                      let name = tags.first?["name"] as? String else {
-                    completion(.success(nil))
-                    return
-                }
-                let page = URL(string: "https://github.com/\(repo)/releases")!
-                completion(.success(Release(version: name, pageURL: page, notes: nil)))
-            }
-        }
-    }
-
-    static func parseRelease(_ data: Data) -> Release? {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tag = json["tag_name"] as? String else { return nil }
-        let page = (json["html_url"] as? String).flatMap(URL.init(string:))
-            ?? URL(string: "https://github.com/\(repo)/releases")!
-        return Release(version: tag, pageURL: page, notes: json["body"] as? String)
-    }
-
-    private static func components(_ version: String) -> [Int] {
-        version
-            .trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
-            .split(separator: ".")
-            .map { part in Int(part.prefix(while: { $0.isNumber })) ?? 0 }
-    }
-
-    /// 远端版本是否比本地新（逐段比较数字）
-    static func isNewer(_ remote: String, than local: String) -> Bool {
-        let remoteParts = components(remote)
-        let localParts = components(local)
-        for index in 0..<max(remoteParts.count, localParts.count) {
-            let remotePart = index < remoteParts.count ? remoteParts[index] : 0
-            let localPart = index < localParts.count ? localParts[index] : 0
-            if remotePart != localPart { return remotePart > localPart }
-        }
-        return false
-    }
-}
+// 更新检查实现与隔离测试见 UpdateChecker.swift。
 
 // MARK: - 开机自启（LaunchAgent）
 
@@ -3550,11 +3461,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func checkForUpdates(manual: Bool) {
-        if manual { model.updateStatus = "正在检查…" }
+        guard !model.checkingUpdate else { return }
+        model.checkingUpdate = true
+        model.updateError = ""
+        model.updateStatus = "正在检查…"
         Log.write("检查更新（\(manual ? "手动" : "自动")）")
         UpdateChecker.check { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
+                self.model.checkingUpdate = false
                 Preferences.lastUpdateCheck = Date()
                 switch result {
                 case .success(let release):
@@ -3569,7 +3484,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         Log.write("已是最新（远端 \(release?.version ?? "无")）")
                     }
                 case .failure(let error):
-                    self.model.updateStatus = "检查失败，稍后重试"
+                    self.model.updateStatus = "暂时无法检查"
+                    self.model.updateError = error.localizedDescription
                     Log.write("检查更新失败：\(error.localizedDescription)")
                 }
                 self.rebuildMenu()
@@ -4291,6 +4207,11 @@ func renderSnapshot(to path: String, page: SettingsPage = .launcher) -> Never {
     let demo = CommandLine.arguments.contains("--demo")
     if demo { NSApp.appearance = NSAppearance(named: .darkAqua) }
     let demoDefaults = UserDefaults(suiteName: "MacKit-Demo-Settings-\(UUID().uuidString)")!
+    if demo {
+        // 文档截图只展示模拟路径，不读取或展示个人同步配置。
+        demoDefaults.set(true, forKey: MacKitCloudSyncEngine.enabledKey)
+        demoDefaults.set("/iCloud Drive/Settings", forKey: MacKitCloudSyncEngine.baseFolderKey)
+    }
     let model = MacKitModel(clipboard: demo ? makeDemoClipboardHistory() : ClipboardHistory(),
                             syncEngine: MacKitCloudSyncEngine(defaults: demo ? demoDefaults : .standard))
     let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -4595,7 +4516,10 @@ func runUpdateCheck() -> Never {
         }
         semaphore.signal()
     }
-    _ = semaphore.wait(timeout: .now() + 25)
+    if semaphore.wait(timeout: .now() + 30) == .timedOut {
+        print("检查失败：等待更新结果超时")
+        exit(1)
+    }
     exit(exitCode)
 }
 
@@ -4717,6 +4641,7 @@ if let index = CommandLine.arguments.firstIndex(of: "--scan-residue"), CommandLi
 }
 if CommandLine.arguments.contains("--version") { runVersionCheck() }
 if CommandLine.arguments.contains("--update-check") { runUpdateCheck() }
+if CommandLine.arguments.contains("--update-fallback-check") { runUpdateFallbackCheck() }
 if CommandLine.arguments.contains("--update-fixture") { runUpdateFixtureTest() }
 
 for flag in ["--login-on", "--login-off", "--login-status"] where CommandLine.arguments.contains(flag) {

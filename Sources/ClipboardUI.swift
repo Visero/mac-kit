@@ -7,8 +7,13 @@ import ApplicationServices
 // MARK: - 原生剪贴板浮层
 
 private final class ClipboardPanel: NSPanel {
+    var onKeyEquivalent: ((NSEvent) -> Bool)?
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if onKeyEquivalent?(event) == true { return true }
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 private final class ClipboardTableView: NSTableView {
@@ -41,9 +46,13 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
     private var rows: [ClipboardEntry] = []
     // nil 是不可选中的置顶分组标题；候选索引与表格行号分离。
     private var tableRows: [Int?] = []
+    // 默认只载入配置数量；向下到普通列表末端时逐条揭示更早记录。
+    private var revealedRegularCount = 0
     private var controls: NSStackView!
     private var keyMonitor: Any?
     private var suppressClose = false
+    var onVisibilityChanged: ((Bool) -> Void)?
+    private(set) var isPresented = false
     private let leftColumn = NSView()
     private let divider = NSBox()
     private let detail = NSView()
@@ -72,9 +81,14 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         panel.delegate = self
+        panel.onKeyEquivalent = { [weak self] event in
+            guard let self, self.isPresented, self.panel.attachedSheet == nil,
+                  self.panel.isKeyWindow || event.window === self.panel else { return false }
+            return self.handleCandidateKey(event)
+        }
         setup()
         reload()
-        observation = history.$archive.sink { [weak self] _ in
+        observation = history.$archive.combineLatest(history.$maxVisible).sink { [weak self] _, _ in
             DispatchQueue.main.async { self?.reload() }
         }
     }
@@ -88,7 +102,7 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         root.layer?.cornerRadius = 12
         root.layer?.masksToBounds = true
         panel.contentView = root
-        search.placeholderString = "搜索文字或来源（⌘1–⌘9 直接取用）"
+        search.placeholderString = "搜索文字或来源（⌘1–9、0、A–Z 取用）"
         search.delegate = self
         search.sendsSearchStringImmediately = true
         search.controlSize = .small
@@ -293,6 +307,7 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         history.query = ""
         search.stringValue = ""
         table.deselectAll(nil)
+        revealedRegularCount = history.maxVisible
         reload()
         if let index = rows.firstIndex(where: { !$0.pinned }) {
             selectRow(index)
@@ -301,6 +316,10 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
     }
 
     var selectedCandidateID: String? { selectedEntry?.id }
+    var isSelectedRowVisible: Bool {
+        guard table.selectedRow >= 0, let clip = table.enclosingScrollView?.contentView else { return false }
+        return clip.bounds.contains(table.rect(ofRow: table.selectedRow))
+    }
 
     /// 自检用：清空选择，回到收起态。
     func clearSelection() {
@@ -341,6 +360,8 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         previousApp = NSWorkspace.shared.frontmostApplication
         if previousApp?.bundleIdentifier == Bundle.main.bundleIdentifier { previousApp = nil }
         prepareOpeningSelection()
+        isPresented = true
+        onVisibilityChanged?(true)
         panel.center()
         panel.makeKeyAndOrderFront(nil)
         panel.contentView?.layoutSubtreeIfNeeded()
@@ -348,13 +369,8 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         NSApp.activate(ignoringOtherApps: true)
         panel.makeFirstResponder(search)
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, self.panel.isKeyWindow else { return event }
-            if event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command),
-               let chars = event.charactersIgnoringModifiers, chars.count == 1,
-               let number = Int(chars), (1...9).contains(number) {
-                self.copyNumber(number)
-                return nil
-            }
+            guard let self, self.panel.isKeyWindow, self.panel.attachedSheet == nil else { return event }
+            if self.handleCandidateKey(event) { return nil }
             switch event.keyCode {
             case 53: self.closePanel(); return nil
             case 125: self.move(1); return nil
@@ -368,6 +384,10 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
     @objc private func closePanel() {
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor = nil }
         panel.orderOut(nil)
+        if isPresented {
+            isPresented = false
+            onVisibilityChanged?(false)
+        }
     }
     func windowDidResignKey(_ notification: Notification) {
         if suppressClose || panel.attachedSheet != nil { return }
@@ -379,9 +399,11 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
     private func fitPanelHeight() {
         // 顶部搜索框与底部计数区；按钮共享计数区，选中前后高度一致。
         let chrome: CGFloat = 72
-        let tableHeight = tableRows.reduce(CGFloat(0)) { height, index in
-            height + (index.map { Self.rowHeight(for: rows[$0]) } ?? 22)
-        }
+        // 后续记录加入滚动文档，不扩大初始浮窗；置顶仍不计普通显示数量。
+        let initialRows = Self.displayedRows(from: history.filtered, limit: history.maxVisible, searching: false)
+        let tableHeight = initialRows.reduce(CGFloat(0)) { height, entry in
+            height + Self.rowHeight(for: entry)
+        } + (initialRows.contains(where: \.pinned) ? 22 : 0)
         let limit = (NSScreen.main?.visibleFrame.height ?? 900) - 120
         let desired = max(220, min(chrome + tableHeight, min(560, limit)))
         var frame = panel.frame
@@ -402,7 +424,7 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
 
     private func reload() {
         let selected = selectedEntry?.id
-        rows = Self.displayedRows(from: history.filtered, limit: history.maxVisible, searching: !history.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        rows = Self.displayedRows(from: history.filtered, limit: max(history.maxVisible, revealedRegularCount), searching: !history.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         tableRows = rows.indices.filter { !rows[$0].pinned }.map { Optional($0) }
         let pinned = rows.indices.filter { rows[$0].pinned }
         if !pinned.isEmpty {
@@ -441,6 +463,17 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         return rows[index]
     }
     func move(_ delta: Int) {
+        // 在最后一个普通候选继续按 ↓，先插入更早记录，而非直接跳到置顶。
+        if delta > 0, history.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let selected = selectedEntry, !selected.pinned {
+            let regular = rows.filter { !$0.pinned }
+            let available = history.filtered.filter { !$0.pinned }.count
+            if let position = regular.firstIndex(where: { $0.id == selected.id }),
+               position + delta >= regular.count, regular.count < available {
+                revealedRegularCount = min(available, max(regular.count + 1, position + delta + 1))
+                reload()
+            }
+        }
         let selectable = tableRows.indices.filter { tableRows[$0] != nil }
         guard !selectable.isEmpty else { return }
         let next: Int
@@ -533,23 +566,23 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         return Self.rowHeight(for: rows[index])
     }
 
-    /// 置顶条目只显示自己配置的快捷键，不占 ⌘1–⌘9；非置顶按显示顺序编号。
+    /// 置顶只显示自定义快捷键；普通项按统一顺序使用数字及字母。
     static func badge(for entry: ClipboardEntry, number: Int?) -> String {
         if entry.pinned { return entry.shortcutLabel ?? "" }
-        guard let number, (1...9).contains(number) else { return "" }
-        return "⌘\(number)"
+        guard let number, let key = ClipboardCandidateShortcut.key(for: number) else { return "" }
+        return "⌘\(key.uppercased())"
     }
 
     static func displayedRows(from filtered: [ClipboardEntry], limit: Int, searching: Bool) -> [ClipboardEntry] {
         let pinned = filtered.filter(\.pinned)
         let regular = filtered.filter { !$0.pinned }
-        return (searching ? regular : Array(regular.prefix(ClipboardHistory.clampedVisible(limit)))) + pinned
+        return (searching ? regular : Array(regular.prefix(max(1, limit)))) + pinned
     }
 
     private func number(forRow row: Int) -> Int? {
         guard let index = candidateIndex(forTableRow: row), !rows[index].pinned else { return nil }
         let number = rows.prefix(index).filter { !$0.pinned }.count
-        return number < 9 ? number + 1 : nil
+        return number < ClipboardCandidateShortcut.keys.count ? number + 1 : nil
     }
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         ClipboardRowView()
@@ -659,7 +692,43 @@ final class ClipboardPanelController: NSObject, NSTableViewDataSource, NSTableVi
         return rows[index].id
     }
 
-    // 与 ⌘数字共用的实际取用路径，也用于隔离回归验证。
+    /// 隔离剪贴板测试：合成窗口快捷键事件，验证窗口路由及显示生命周期；不替代 GUI 键盘验收。
+    func verifyCandidateKeyboard(_ key: String) -> Bool {
+        var transitions: [Bool] = []
+        let oldCallback = onVisibilityChanged
+        onVisibilityChanged = { value in transitions.append(value) }
+        defer { closePanel(); onVisibilityChanged = oldCallback }
+        show()
+        previousApp = nil // 隔离测试不切回或向其它应用粘贴。
+        guard let position = ClipboardCandidateShortcut.position(for: key),
+              let expected = numberedCandidateID(position),
+              let before = history.entry(id: expected),
+              let code = KeyCodes.map[key],
+              let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+                context: nil, characters: key, charactersIgnoringModifiers: key,
+                isARepeat: false, keyCode: UInt16(code)) else { return false }
+        let handled = panel.performKeyEquivalent(with: event)
+        let ok = history.entry(id: expected)!.copiedAt > before.copiedAt
+            && !panel.isVisible && !isPresented && transitions == [true, false]
+        if !ok { print("键盘回归诊断：key=\(key) keyWindow=\(panel.isKeyWindow) handled=\(handled) transitions=\(transitions) visible=\(panel.isVisible)") }
+        return ok
+    }
+
+    @discardableResult
+    func handleCandidateKey(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection([.command, .option, .control, .shift, .function])
+        guard flags == [.command] else { return false }
+        let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
+        let key = ClipboardCandidateShortcut.position(for: chars) != nil ? chars :
+            ClipboardCandidateShortcut.keys.first(where: { KeyCodes.map[$0] == Int(event.keyCode) })
+        guard let key, let position = ClipboardCandidateShortcut.position(for: key) else { return false }
+        // 已映射但当前没有候选时也吞掉按键，避免 ⌘Q/⌘W 意外退出或关窗。
+        copyNumber(position)
+        return true
+    }
+
+    // 与 ⌘数字/字母共用的实际取用路径，也用于隔离回归验证。
     func copyNumber(_ number: Int) {
         guard let id = numberedCandidateID(number), let index = rows.firstIndex(where: { $0.id == id }) else { return }
         selectRow(index)
@@ -997,14 +1066,15 @@ struct ClipboardSettingsPage: View {
             Text(history.storageNote).font(.system(size: 10)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
-                Text("列表显示条数（不含置顶）")
+                Text("初始显示条数（不含置顶）")
                 Spacer()
-                Stepper(value: Binding(get: { history.maxVisible }, set: { history.setMaxVisible($0) }), in: 1...20) {
+                Stepper(value: Binding(get: { history.maxVisible }, set: { history.setMaxVisible($0) }), in: 1...ClipboardCandidateShortcut.keys.count) {
                     Text("\(history.maxVisible) 条").font(.system(size: 11)).monospacedDigit()
                 }
                 .controlSize(.small)
+                .accessibilityIdentifier("clipboardMaxVisible")
             }
-            Text("非置顶按顺序使用 ⌘1–⌘9；置顶不占编号，可单独绑定。")
+            Text("初始可设 1–36 条，默认 9；列表末端按 ↓ 显示更早记录。前十条用 ⌘1–⌘9、⌘0，之后按 ⌘A–⌘Z。置顶不计入；浮窗内普通键优先，关闭后恢复置顶快捷键。")
                 .font(.system(size: 10)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if !pinnedEntries.isEmpty {
@@ -1094,7 +1164,9 @@ struct ClipboardSettingsPage: View {
                 Text("历史记录 · \(history.entries.count) 项").font(.system(size: 12, weight: .medium))
                 Spacer()
                 Button("清空历史") { history.showClearConfirmation = true }
-                    .controlSize(.small).disabled(history.entries.isEmpty)
+                    .controlSize(.small).disabled(!history.hasClearableHistory)
+                    .help("仅清空非置顶记录，保留置顶内容与快捷键")
+                    .accessibilityIdentifier("clipboardClearHistory")
             }
             TextField("搜索历史", text: $history.query).textFieldStyle(.roundedBorder)
             LazyVStack(spacing: 4) {
@@ -1138,11 +1210,11 @@ struct ClipboardSettingsPage: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .font(.system(size: 12))
-        .alert("清空剪贴板历史？", isPresented: $history.showClearConfirmation) {
+        .alert("清空非置顶历史？", isPresented: $history.showClearConfirmation) {
             Button("清空", role: .destructive) { history.clear() }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("包括置顶项，清空后无法恢复。iCloud 模式也会同步删除这些记录；系统当前剪贴板不受影响。")
+            Text("仅删除非置顶记录，置顶内容及其快捷键会保留。删除后无法恢复；iCloud 模式会同步删除普通记录，系统当前剪贴板不受影响。")
         }
     }
 
@@ -1296,7 +1368,10 @@ func runClipboardCheck() -> Never {
         pinnedSample.pinned = true
         guard ClipboardPanelController.badge(for: history.entry(id: shortcutEntry.id)!, number: 1) == "⌘M",
               ClipboardPanelController.badge(for: numbered, number: 5) == "⌘5",
-              ClipboardPanelController.badge(for: numbered, number: 10) == "",
+              ClipboardPanelController.badge(for: numbered, number: 10) == "⌘0",
+              ClipboardPanelController.badge(for: numbered, number: 11) == "⌘A",
+              ClipboardPanelController.badge(for: numbered, number: 36) == "⌘Z",
+              ClipboardPanelController.badge(for: numbered, number: 37) == "",
               ClipboardPanelController.badge(for: numbered, number: nil) == "",
               ClipboardPanelController.badge(for: pinnedSample, number: 1) == "" else { throw ClipboardError.invalidArchive }
         var oldRegularShortcut = numbered
@@ -1312,7 +1387,7 @@ func runClipboardCheck() -> Never {
         history.setMaxVisible(0)
         guard history.maxVisible == 1 else { throw ClipboardError.invalidArchive }
         history.setMaxVisible(99)
-        guard history.maxVisible == 30 else { throw ClipboardError.invalidArchive }
+        guard history.maxVisible == 36 else { throw ClipboardError.invalidArchive }
         history.setMaxVisible(9)
         guard history.maxVisible == 9 else { throw ClipboardError.invalidArchive }
         history.insert(ClipboardEntry.make(text: shortcutEntry.text ?? "", now: 400)!)
@@ -1348,9 +1423,12 @@ func runClipboardCheck() -> Never {
         other.insert(ClipboardEntry.make(text: "另一设备记录", now: Date().timeIntervalSince1970)!)
         history.syncNow()
         guard history.entries.contains(where: { $0.text == "另一设备记录" }) else { throw ClipboardError.invalidArchive }
+        let pinsBeforeClear = history.entries.filter(\.pinned)
+        let systemChangeBeforeClear = board.changeCount
         history.clear()
         other.syncNow()
-        guard other.entries.isEmpty else { throw ClipboardError.invalidArchive }
+        guard history.entries == pinsBeforeClear, other.entries == pinsBeforeClear,
+              board.changeCount == systemChangeBeforeClear else { throw ClipboardError.invalidArchive }
         guard history.copy(first), board.string(forType: .string) == first.text,
               ClipboardHistory.capture(board) == nil else { throw ClipboardError.invalidArchive }
         // 读取损坏文件不得覆盖；符号链接不得写入。
@@ -1366,6 +1444,75 @@ func runClipboardCheck() -> Never {
         let linked = ClipboardHistory(defaults: badDefaults, board: board, localURL: symlink)
         linked.chooseStorage(.local)
         guard linked.storage == .memory else { throw ClipboardError.invalidArchive }
+        stage = "clear-preserves-pins"
+        let clearSuite = suite + "-clear-pins"
+        let clearDefaults = UserDefaults(suiteName: clearSuite)!
+        defer { clearDefaults.removePersistentDomain(forName: clearSuite) }
+        let clearURL = root.appendingPathComponent("clear-pins.json")
+        let keepHistory = ClipboardHistory(defaults: clearDefaults, board: board, localURL: clearURL)
+        let clearTime = Date().timeIntervalSince1970
+        var keepText = ClipboardEntry.make(text: "保留置顶文字", source: "来源保留", now: clearTime - 100)!
+        keepText.pinned = true; keepText.shortcutKey = "m"; keepText.shortcutModifiers = ["command"]
+        var keepImage = ClipboardEntry.make(png: png, now: clearTime - 90)!
+        keepImage.pinned = true; keepImage.shortcutKey = "s"; keepImage.shortcutModifiers = ["command"]
+        let removeText = ClipboardEntry.make(text: "清除普通文字", now: clearTime + 100)!
+        [keepText, keepImage, removeText].forEach { keepHistory.insert($0) }
+        keepHistory.chooseStorage(.local)
+        let beforeKeepClear = keepHistory.archive
+        let keepPins = keepHistory.entries.filter(\.pinned)
+        let beforeBoard = board.changeCount
+        keepHistory.clear()
+        guard keepHistory.entries == keepPins, !keepHistory.hasClearableHistory,
+              board.changeCount == beforeBoard,
+              keepHistory.archive.regularClearedAt > removeText.editedAt,
+              keepHistory.archive.clearedAt == beforeKeepClear.clearedAt,
+              ClipboardArchive.merge(beforeKeepClear, keepHistory.archive).entries == keepPins,
+              ClipboardArchive.merge(keepHistory.archive, beforeKeepClear).entries == keepPins else { throw ClipboardError.invalidArchive }
+        let noOpClear = keepHistory.archive
+        keepHistory.clear()
+        guard keepHistory.archive == noOpClear else { throw ClipboardError.invalidArchive }
+        let keepReload = ClipboardHistory(defaults: clearDefaults, board: board, localURL: clearURL)
+        keepReload.start(); keepReload.stop()
+        guard keepReload.entries == keepPins else { throw ClipboardError.invalidArchive }
+        // 旧版存档缺少新字段仍可读取，旧全清标记仍删除旧置顶。
+        var oldJSON = try JSONSerialization.jsonObject(with: JSONEncoder().encode(beforeKeepClear)) as! [String: Any]
+        oldJSON.removeValue(forKey: "regularClearedAt")
+        let oldArchive = try JSONDecoder().decode(ClipboardArchive.self, from: JSONSerialization.data(withJSONObject: oldJSON)).validated()
+        guard oldArchive.regularClearedAt == 0 else { throw ClipboardError.invalidArchive }
+        var legacyCleared = oldArchive
+        legacyCleared.entries = []; legacyCleared.clearedAt = clearTime + 200
+        guard ClipboardArchive.merge(oldArchive, legacyCleared).entries.isEmpty else { throw ClipboardError.invalidArchive }
+        let clearCloud = root.appendingPathComponent("ClearCloud", isDirectory: true)
+        try FileManager.default.createDirectory(at: clearCloud, withIntermediateDirectories: true)
+        keepHistory.setCloudFolder(clearCloud)
+        keepReload.setCloudFolder(clearCloud)
+        let remoteRegular = ClipboardEntry.make(text: "另一端普通内容", now: clearTime + 300)!
+        var remotePin = ClipboardEntry.make(text: "另一端置顶", now: clearTime - 80)!
+        remotePin.pinned = true; remotePin.shortcutKey = "k"; remotePin.shortcutModifiers = ["command"]
+        keepReload.insert(remotePin); keepReload.insert(remoteRegular)
+        // 清空时先合并可见远端数据；未提前手动同步的远端置顶也应保留。
+        keepHistory.clear()
+        keepReload.syncNow(); keepHistory.syncNow()
+        guard keepHistory.entries.count == 3, keepReload.entries == keepHistory.entries,
+              keepHistory.entries.allSatisfy(\.pinned),
+              keepHistory.entry(id: remotePin.id)?.shortcutLabel == "⌘K",
+              keepHistory.entry(id: keepText.id) == keepText,
+              keepHistory.entry(id: keepImage.id) == keepImage else { throw ClipboardError.invalidArchive }
+        // 取消置顶仍是可见记录；再次清空才删除。显式删除置顶依然有效。
+        keepReload.togglePin(remotePin)
+        keepHistory.syncNow()
+        guard keepHistory.entry(id: remotePin.id)?.pinned == false else { throw ClipboardError.invalidArchive }
+        keepHistory.clear(); keepReload.syncNow()
+        guard keepReload.entry(id: remotePin.id) == nil,
+              keepReload.entries.count == 2 else { throw ClipboardError.invalidArchive }
+        keepHistory.delete(keepText); keepReload.syncNow()
+        guard keepReload.entry(id: keepText.id) == nil,
+              keepReload.entry(id: keepImage.id) == keepImage else { throw ClipboardError.invalidArchive }
+        guard keepReload.copy(removeText) else { throw ClipboardError.invalidArchive }
+        keepHistory.syncNow()
+        guard keepHistory.entry(id: removeText.id) != nil,
+              keepHistory.entry(id: keepImage.id) == keepImage else { throw ClipboardError.invalidArchive }
+        print("✓ 清空仅删普通记录、置顶文字/图片/快捷键不变、系统剪贴板不变、空清空、本机重载、旧存档兼容、双端同步及显式删除通过")
         stage = "opening-selection"
         let openingSuite = suite + "-opening"
         let openingDefaults = UserDefaults(suiteName: openingSuite)!
@@ -1496,6 +1643,102 @@ func runClipboardCheck() -> Never {
         guard usedHistory.entry(id: clickFirst)!.copiedAt > beforeSameClick,
               usedHistory.entries.count == 4 else { throw ClipboardError.invalidArchive }
         print("✓ 原生左键单击复制并关闭、已选中条目取用、右键/Control点击/空白/标题不复制及键盘浏览通过（隔离剪贴板）")
+        stage = "extended-candidate-shortcuts"
+        let sequenceSuite = suite + "-sequence"
+        let sequenceDefaults = UserDefaults(suiteName: sequenceSuite)!
+        defer { sequenceDefaults.removePersistentDomain(forName: sequenceSuite) }
+        let sequenceHistory = ClipboardHistory(defaults: sequenceDefaults, board: board, localURL: root.appendingPathComponent("sequence.json"))
+        guard sequenceHistory.maxVisible == 9, Set(ClipboardCandidateShortcut.keys).count == 36 else { throw ClipboardError.invalidArchive }
+        let sequenceTime = Date().timeIntervalSince1970 + 1000
+        let sequenceEntries = (1...40).map { ClipboardEntry.make(text: "编号测试 \($0)", now: sequenceTime - Double($0))! }
+        sequenceEntries.forEach { sequenceHistory.insert($0) }
+        var sequencePin = ClipboardEntry.make(text: "独立置顶不占序号", now: sequenceTime + 1)!
+        sequencePin.pinned = true; sequencePin.shortcutKey = "a"; sequencePin.shortcutModifiers = ["command"]
+        sequenceHistory.insert(sequencePin)
+        let sequencePanel = ClipboardPanelController(history: sequenceHistory)
+        sequencePanel.prepareOpeningSelection()
+        guard sequencePanel.numberedCandidateID(9) == sequenceEntries[8].id,
+              sequencePanel.numberedCandidateID(10) == nil else { throw ClipboardError.invalidArchive }
+        stage = "older-history-navigation"
+        let initialSequenceFrame = sequencePanel.layoutFrame
+        let beforeBrowsing = sequenceHistory.archive
+        for position in 2...40 {
+            sequencePanel.move(1)
+            guard sequencePanel.selectedCandidateID == sequenceEntries[position - 1].id,
+                  sequencePanel.isSelectedRowVisible,
+                  sequencePanel.layoutFrame == initialSequenceFrame else {
+                throw NSError(domain: "check", code: 1, userInfo: [NSLocalizedDescriptionKey: "更早记录方向键或滚动失败 position=\(position) \(sequencePanel.layoutDiagnostics)"])
+            }
+        }
+        guard sequenceHistory.archive == beforeBrowsing,
+              sequencePanel.numberedCandidateID(10) == sequenceEntries[9].id,
+              sequencePanel.numberedCandidateID(36) == sequenceEntries[35].id,
+              sequencePanel.numberedCandidateID(37) == nil else { throw ClipboardError.invalidArchive }
+        sequencePanel.move(1)
+        guard sequencePanel.selectedCandidateID == sequencePin.id else { throw ClipboardError.invalidArchive }
+        sequencePanel.move(-1)
+        guard sequencePanel.selectedCandidateID == sequenceEntries[39].id else { throw ClipboardError.invalidArchive }
+        sequencePanel.prepareOpeningSelection()
+        guard sequencePanel.selectedCandidateID == sequenceEntries[0].id,
+              sequencePanel.numberedCandidateID(10) == nil,
+              sequencePanel.layoutFrame == initialSequenceFrame else { throw ClipboardError.invalidArchive }
+        for _ in 1...9 { sequencePanel.move(1) }
+        guard sequencePanel.selectedCandidateID == sequenceEntries[9].id else { throw ClipboardError.invalidArchive }
+        sequencePanel.copyNumber(10)
+        sequencePanel.prepareOpeningSelection()
+        guard sequencePanel.selectedCandidateID == sequenceEntries[9].id,
+              sequenceHistory.entries.filter({ $0.id == sequenceEntries[9].id }).count == 1 else { throw ClipboardError.invalidArchive }
+        print("✓ 默认9条向下浏览到第40条、选中行自动滚动、面板高度不增、置顶分组跳过标题、浏览不复制、重新打开重置及更早记录取用前置通过")
+        // 恢复原序以独立验证全部36个快捷键。
+        sequenceEntries.forEach { sequenceHistory.insert($0) }
+        stage = "extended-candidate-shortcuts"
+        sequenceHistory.setMaxVisible(36)
+        sequencePanel.prepareOpeningSelection()
+        for position in 1...36 {
+            let key = ClipboardCandidateShortcut.key(for: position)!
+            guard ClipboardCandidateShortcut.position(for: key) == position,
+                  sequencePanel.numberedCandidateID(position) == sequenceEntries[position - 1].id,
+                  ClipboardPanelController.badge(for: sequenceEntries[position - 1], number: position) == "⌘" + key.uppercased() else { throw ClipboardError.invalidArchive }
+        }
+        guard sequencePanel.numberedCandidateID(37) == nil, sequencePanel.validateLayout(),
+              sequencePanel.layoutFrame.height <= 560 else { throw ClipboardError.invalidArchive }
+        let sequenceReload = ClipboardHistory(defaults: sequenceDefaults, board: board)
+        guard sequenceReload.maxVisible == 36 else { throw ClipboardError.invalidArchive }
+        func candidateEvent(_ key: String, flags: NSEvent.ModifierFlags = [.command], characters: String? = nil) -> NSEvent {
+            NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+                windowNumber: 0, context: nil, characters: characters ?? key,
+                charactersIgnoringModifiers: characters ?? key, isARepeat: false, keyCode: UInt16(KeyCodes.map[key]!))!
+        }
+        for key in ["0", "a", "z", "q", "w", "c"] {
+            sequencePanel.prepareOpeningSelection()
+            let position = ClipboardCandidateShortcut.position(for: key)!
+            let expectedID = sequencePanel.numberedCandidateID(position)!
+            guard sequencePanel.handleCandidateKey(candidateEvent(key)),
+                  sequenceHistory.entries.first(where: { !$0.pinned })?.id == expectedID else { throw ClipboardError.invalidArchive }
+        }
+        sequencePanel.prepareOpeningSelection()
+        let beforeRejected = sequenceHistory.archive
+        guard !sequencePanel.handleCandidateKey(candidateEvent("a", flags: [.command, .shift])),
+              !sequencePanel.handleCandidateKey(candidateEvent("a", flags: [.command, .option])),
+              !sequencePanel.handleCandidateKey(candidateEvent("a", flags: [])),
+              sequenceHistory.archive == beforeRejected else { throw ClipboardError.invalidArchive }
+        let physicalA = sequencePanel.numberedCandidateID(11)!
+        guard sequencePanel.handleCandidateKey(candidateEvent("a", characters: "あ")),
+              sequenceHistory.entries.first(where: { !$0.pinned })?.id == physicalA else { throw ClipboardError.invalidArchive }
+        sequenceHistory.query = "编号测试 40"
+        let searchSequence = ClipboardPanelController(history: sequenceHistory)
+        guard searchSequence.numberedCandidateID(1) == sequenceEntries[39].id,
+              searchSequence.numberedCandidateID(2) == nil else { throw ClipboardError.invalidArchive }
+        let beforeEmptyKey = sequenceHistory.archive
+        guard searchSequence.handleCandidateKey(candidateEvent("z")),
+              sequenceHistory.archive == beforeEmptyKey,
+              sequenceHistory.entry(id: sequencePin.id)?.shortcutLabel == "⌘A" else { throw ClipboardError.invalidArchive }
+        sequenceHistory.query = ""
+        guard sequencePanel.verifyCandidateKeyboard("0"), sequencePanel.verifyCandidateKeyboard("a"),
+              sequencePanel.verifyCandidateKeyboard("z") else {
+            throw NSError(domain: "check", code: 1, userInfo: [NSLocalizedDescriptionKey: "浮窗真实键盘事件或显示/关闭生命周期失败"])
+        }
+        print("✓ 默认9/上限36持久化、1–9/0/A–Z全36个徽标与顺序、数字/字母取用、搜索重编号、额外修饰键隔离及置顶不占编号通过")
         stage = "controller"
         // 加足列表高度，避免 220pt 最小高度掩盖选中后额外增高的问题。
         let layoutTime = Date().timeIntervalSince1970 + 10

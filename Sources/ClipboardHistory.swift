@@ -58,11 +58,25 @@ struct ClipboardArchive: Codable, Equatable {
     var schema = 1
     var entries: [ClipboardEntry] = []
     var deleted: [String: Double] = [:]
+    // 旧版本的全清标记保留其原有含义，避免恢复已删除的旧置顶。
     var clearedAt: Double = 0
+    var regularClearedAt: Double = 0
+
+    enum CodingKeys: String, CodingKey { case schema, entries, deleted, clearedAt, regularClearedAt }
+    init() {}
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try values.decode(Int.self, forKey: .schema)
+        entries = try values.decode([ClipboardEntry].self, forKey: .entries)
+        deleted = try values.decode([String: Double].self, forKey: .deleted)
+        clearedAt = try values.decode(Double.self, forKey: .clearedAt)
+        regularClearedAt = try values.decodeIfPresent(Double.self, forKey: .regularClearedAt) ?? 0
+    }
 
     func validated() throws -> ClipboardArchive {
         guard schema == 1, entries.count <= 500, deleted.count <= 10000,
-              clearedAt.isFinite, clearedAt >= 0 else { throw ClipboardError.invalidArchive }
+              clearedAt.isFinite, clearedAt >= 0,
+              regularClearedAt.isFinite, regularClearedAt >= 0 else { throw ClipboardError.invalidArchive }
         for entry in entries {
             guard entry.copiedAt.isFinite, entry.editedAt.isFinite,
                   entry.copiedAt >= 0, entry.editedAt >= entry.copiedAt,
@@ -79,16 +93,19 @@ struct ClipboardArchive: Codable, Equatable {
     static func merge(_ lhs: ClipboardArchive, _ rhs: ClipboardArchive) -> ClipboardArchive {
         var out = lhs
         out.clearedAt = max(lhs.clearedAt, rhs.clearedAt)
+        out.regularClearedAt = max(lhs.regularClearedAt, rhs.regularClearedAt)
         for (id, timestamp) in rhs.deleted { out.deleted[id] = max(timestamp, out.deleted[id] ?? 0) }
         var all: [String: ClipboardEntry] = [:]
         for entry in lhs.entries + rhs.entries {
-            // 清空删除所有历史，包括置顶；重新复制（新 copiedAt）可再进入历史。
-            guard entry.copiedAt > out.clearedAt,
-                  entry.editedAt > (out.deleted[entry.id] ?? 0) else { continue }
+            // 先取最新置顶状态，再判断清空，防止旧的置顶副本复活普通记录。
             if let old = all[entry.id], old.editedAt >= entry.editedAt { continue }
             all[entry.id] = entry
         }
-        out.entries = bounded(Array(all.values))
+        out.entries = bounded(all.values.filter { entry in
+            entry.copiedAt > out.clearedAt
+                && entry.editedAt > (out.deleted[entry.id] ?? 0)
+                && (entry.pinned || entry.editedAt > out.regularClearedAt)
+        })
         return out
     }
 
@@ -126,6 +143,18 @@ enum ClipboardError: LocalizedError {
 }
 
 // MARK: - 采集、存储与同步
+
+// 普通候选的唯一编号表：第十条为 0，之后按英文字母顺序。
+enum ClipboardCandidateShortcut {
+    static let keys = Array("1234567890abcdefghijklmnopqrstuvwxyz").map(String.init)
+    static func key(for position: Int) -> String? {
+        guard (1...keys.count).contains(position) else { return nil }
+        return keys[position - 1]
+    }
+    static func position(for key: String) -> Int? {
+        keys.firstIndex(of: key.lowercased()).map { $0 + 1 }
+    }
+}
 
 final class ClipboardHistory: ObservableObject {
     @Published private(set) var archive = ClipboardArchive()
@@ -222,7 +251,7 @@ final class ClipboardHistory: ObservableObject {
         maxVisible = clamped
         defaults.set(clamped, forKey: "MacKit.clipboard.maxVisible")
     }
-    static func clampedVisible(_ value: Int) -> Int { min(30, max(1, value)) }
+    static func clampedVisible(_ value: Int) -> Int { min(ClipboardCandidateShortcut.keys.count, max(1, value)) }
 
     static func capture(_ board: NSPasteboard, source: String = "") -> ClipboardEntry? {
         let types = Set((board.types ?? []).map(\.rawValue))
@@ -283,7 +312,8 @@ final class ClipboardHistory: ObservableObject {
             status = "最多置顶 30 项"; return
         }
         archive.entries[index].pinned.toggle()
-        archive.entries[index].editedAt = Date().timeIntervalSince1970
+        archive.entries[index].editedAt = max(Date().timeIntervalSince1970,
+            max(archive.entries[index].editedAt.nextUp, archive.regularClearedAt.nextUp))
         archive.entries = ClipboardArchive.bounded(archive.entries)
         persist()
     }
@@ -294,13 +324,29 @@ final class ClipboardHistory: ObservableObject {
         persist()
     }
 
+    var hasClearableHistory: Bool { entries.contains { !$0.pinned } }
+
     func clear() {
-        archive.clearedAt = Date().timeIntervalSince1970
-        archive.entries = []
-        archive.deleted = [:]
-        persist()
+        if storage == .iCloud {
+            do { archive = ClipboardArchive.merge(archive, try readCurrent()) }
+            catch { status = error.localizedDescription; return }
+        }
+        guard hasClearableHistory else { status = "没有可清空的普通历史，置顶已保留"; return }
+        let latest = archive.entries.map(\.editedAt).max() ?? 0
+        let cutoff = max(Date().timeIntervalSince1970,
+            max(latest.nextUp, max(archive.clearedAt.nextUp, archive.regularClearedAt.nextUp)))
+        archive.regularClearedAt = cutoff
+        // 显式删除标记同时兼容旧客户端；不重置既有删除记录。
+        for entry in archive.entries where !entry.pinned {
+            archive.deleted[entry.id] = max(cutoff, archive.deleted[entry.id] ?? 0)
+        }
+        archive.entries.removeAll { !$0.pinned }
+        if let id = selectedID, !archive.entries.contains(where: { $0.id == id }) { selectedID = nil }
+        let saved = persist()
         lastSync = .distantPast
-        status = storage == .memory ? "本次历史已清空" : "历史已清空（同步模式会同步删除）"
+        if saved {
+            status = "普通历史已清空，置顶已保留" + (storage == .iCloud ? "（同步删除普通记录）" : "")
+        }
     }
 
     func moveSelection(_ delta: Int) {
@@ -333,7 +379,8 @@ final class ClipboardHistory: ObservableObject {
         // 成功取用后显式刷新原记录，下次打开即成为普通候选的 ⌘1。
         // 单调时间也兼容快速连续使用、系统时间回拨及同步到的未来时间。
         let latest = archive.entries.map(\.copiedAt).max() ?? 0
-        let previous = max(used.editedAt, max(archive.clearedAt, archive.deleted[used.id] ?? 0))
+        let previous = max(used.editedAt, max(archive.regularClearedAt,
+            max(archive.clearedAt, archive.deleted[used.id] ?? 0)))
         let timestamp = max(Date().timeIntervalSince1970, max(latest.nextUp, previous.nextUp))
         used.copiedAt = timestamp
         used.editedAt = timestamp
@@ -479,12 +526,15 @@ final class ClipboardHistory: ObservableObject {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
-    private func persist() {
-        guard storage != .memory, !loadFailed else { return }
+    @discardableResult
+    private func persist() -> Bool {
+        guard storage != .memory else { return true }
+        guard !loadFailed else { return false }
         lastSync = Date()
         do {
             if storage == .iCloud { archive = ClipboardArchive.merge(archive, try readCurrent()) }
             try saveCurrent()
-        } catch { status = error.localizedDescription }
+            return true
+        } catch { status = error.localizedDescription; return false }
     }
 }

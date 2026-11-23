@@ -2067,7 +2067,7 @@ struct SettingsView: View {
         case .settings: return "修改即时生效"
         case .launcher: return model.status
         case .menuBar: return "点箭头即可折叠 / 展开"
-        case .clipboard: return "⌥Space 打开历史；回车复制，↑↓ 选择，Esc 关闭"
+        case .clipboard: return "⌥Space 打开历史；单击或回车复制，⌘1–9、0、A–Z 取用"
         case .scroll: return "设置仅保存在本机，关闭后恢复原滚动方向"
         }
     }
@@ -3604,7 +3604,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func openClipboard() {
-        if clipboardPanel == nil { clipboardPanel = ClipboardPanelController(history: model.clipboard) }
+        if clipboardPanel == nil {
+            let controller = ClipboardPanelController(history: model.clipboard)
+            controller.onVisibilityChanged = { [weak self] _ in self?.refreshClipboardShortcuts() }
+            clipboardPanel = controller
+        }
         clipboardPanel?.show()
     }
 
@@ -3960,6 +3964,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let key = entry.shortcutKey?.lowercased(),
                   let modifiers = entry.shortcutModifiers, !modifiers.isEmpty,
                   let code = KeyCodes.map[key] else { continue }
+            // 浮窗内普通候选快捷键优先；临时注销冲突的全局快捷键，
+            // 让原生 keyDown 进入浮窗。关闭浮窗后重新注册，不修改绑定配置。
+            if clipboardPanel?.isPresented == true,
+               Set(modifiers) == ["command"], ClipboardCandidateShortcut.position(for: key) != nil { continue }
             let id = clipboardEntryHotKeyBase + offset
             offset += 1
             var ref: EventHotKeyRef?
